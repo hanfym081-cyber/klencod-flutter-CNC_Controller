@@ -25,7 +25,7 @@ class CNCApp extends StatelessWidget {
       theme: ThemeData(
         brightness: Brightness.dark,
         scaffoldBackgroundColor: bg,
-        colorScheme: ColorScheme.dark(
+        colorScheme: const ColorScheme.dark(
           primary: blue,
           surface: panel,
         ),
@@ -51,6 +51,9 @@ class _CNCPageState extends State<CNCPage> {
   double feed = 50;
   double rpm = 1200;
 
+  // مسافة الحركة لكل ضغطة
+  double jogStep = 1.0;
+
   bool spindle = false;
   bool running = false;
   bool alarm = false;
@@ -73,9 +76,9 @@ class _CNCPageState extends State<CNCPage> {
     if (alarm || running) return;
 
     setState(() {
-      if (axis == 'X') x = (x + amount).clamp(-500, 500);
-      if (axis == 'Y') y = (y + amount).clamp(-500, 500);
-      if (axis == 'Z') z = (z + amount).clamp(-200, 200);
+      if (axis == 'X') x = (x + amount).clamp(-500.0, 500.0);
+      if (axis == 'Y') y = (y + amount).clamp(-500.0, 500.0);
+      if (axis == 'Z') z = (z + amount).clamp(-200.0, 200.0);
     });
   }
 
@@ -188,7 +191,7 @@ class _CNCPageState extends State<CNCPage> {
     );
   }
 
-  Widget axisCard(String name, double value, double limit) {
+  Widget axisCard(String name, double value) {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -228,7 +231,7 @@ class _CNCPageState extends State<CNCPage> {
                 child: jogButton(
                   label: '-',
                   color: red,
-                  onTap: () => jog(name, -limit),
+                  onTap: () => jog(name, -jogStep),
                 ),
               ),
               const SizedBox(width: 8),
@@ -236,7 +239,7 @@ class _CNCPageState extends State<CNCPage> {
                 child: jogButton(
                   label: '+',
                   color: green,
-                  onTap: () => jog(name, limit),
+                  onTap: () => jog(name, jogStep),
                 ),
               ),
             ],
@@ -298,6 +301,30 @@ class _CNCPageState extends State<CNCPage> {
     );
   }
 
+  Widget buildJogSelector() {
+    return DropdownButtonFormField<double>(
+      value: jogStep,
+      decoration: const InputDecoration(
+        labelText: 'مسافة الحركة لكل ضغطة',
+        suffixText: 'mm',
+        border: OutlineInputBorder(),
+      ),
+      items: const [
+        DropdownMenuItem(value: 0.01, child: Text('0.01 mm')),
+        DropdownMenuItem(value: 0.1, child: Text('0.1 mm')),
+        DropdownMenuItem(value: 1.0, child: Text('1 mm')),
+        DropdownMenuItem(value: 10.0, child: Text('10 mm')),
+      ],
+      onChanged: alarm || running
+          ? null
+          : (value) {
+              if (value != null) {
+                setState(() => jogStep = value);
+              }
+            },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Directionality(
@@ -321,11 +348,7 @@ class _CNCPageState extends State<CNCPage> {
                 icon: Icons.monitor_heart,
                 child: Row(
                   children: [
-                    Icon(
-                      Icons.circle,
-                      color: statusColor,
-                      size: 15,
-                    ),
+                    Icon(Icons.circle, color: statusColor, size: 15),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Text(
@@ -353,13 +376,15 @@ class _CNCPageState extends State<CNCPage> {
                 icon: Icons.control_camera,
                 child: Column(
                   children: [
+                    buildJogSelector(),
+                    const SizedBox(height: 16),
                     Row(
                       children: [
-                        Expanded(child: axisCard('X', x, 1)),
+                        Expanded(child: axisCard('X', x)),
                         const SizedBox(width: 8),
-                        Expanded(child: axisCard('Y', y, 1)),
+                        Expanded(child: axisCard('Y', y)),
                         const SizedBox(width: 8),
-                        Expanded(child: axisCard('Z', z, 1)),
+                        Expanded(child: axisCard('Z', z)),
                       ],
                     ),
                     const SizedBox(height: 12),
@@ -383,8 +408,7 @@ class _CNCPageState extends State<CNCPage> {
                 child: Column(
                   children: [
                     Row(
-                      mainAxisAlignment:
-                          MainAxisAlignment.spaceBetween,
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         const Text('سرعة الدوران'),
                         Text(
@@ -411,9 +435,9 @@ class _CNCPageState extends State<CNCPage> {
                       child: FilledButton.icon(
                         onPressed: alarm
                             ? null
-                            : () => setState(
-                                  () => spindle = !spindle,
-                                ),
+                            : () => setState(() {
+                                  spindle = !spindle;
+                                }),
                         icon: Icon(
                           spindle
                               ? Icons.stop_circle
@@ -425,8 +449,7 @@ class _CNCPageState extends State<CNCPage> {
                               : 'تشغيل الاسبيندل',
                         ),
                         style: FilledButton.styleFrom(
-                          backgroundColor:
-                              spindle ? red : green,
+                          backgroundColor: spindle ? red : green,
                           padding: const EdgeInsets.all(14),
                         ),
                       ),
@@ -458,8 +481,7 @@ class _CNCPageState extends State<CNCPage> {
                           : (v) => setState(() => feed = v),
                     ),
                     const Row(
-                      mainAxisAlignment:
-                          MainAxisAlignment.spaceBetween,
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text('0%', style: TextStyle(color: muted)),
                         Text('100%', style: TextStyle(color: muted)),
@@ -526,9 +548,7 @@ class _CNCPageState extends State<CNCPage> {
                         ),
                         child: const Text(
                           'إيقاف فوري للطوارئ',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                          ),
+                          style: TextStyle(fontWeight: FontWeight.bold),
                         ),
                       ),
                     ),
@@ -547,7 +567,7 @@ class _CNCPageState extends State<CNCPage> {
               const Padding(
                 padding: EdgeInsets.all(12),
                 child: Text(
-                  'CNC Simulator V1.0 - محاكاة تعليمية فقط',
+                  'CNC Simulator V1.1 - محاكاة تعليمية فقط',
                   style: TextStyle(color: muted, fontSize: 12),
                 ),
               ),
