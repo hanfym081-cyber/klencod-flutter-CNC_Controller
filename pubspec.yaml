@@ -1,5 +1,6 @@
+
 name: cnc_controller
-description: A professional task manager built with Flutter.
+description: CNC Controller for Mach3 Mill
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -10,6 +11,8 @@ dependencies:
   flutter:
     sdk: flutter
   shared_preferences: ^2.2.2
+  file_picker: ^8.0.0
+  web_socket_channel: ^2.4.5
 
 flutter:
   uses-material-design: true
