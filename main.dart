@@ -1,637 +1,478 @@
-import 'dart:async';
+
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() => runApp(const Mach3Remote());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const Mach3App());
+}
 
-const bg = Color(0xFF171C22);
-const panel = Color(0xFF252D36);
-const green = Color(0xFF36D17C);
-const orange = Color(0xFFFFA62B);
-const red = Color(0xFFE53935);
+const bg = Color(0xFF15191E);
+const panel = Color(0xFF222830);
+const panel2 = Color(0xFF2B333D);
+const accent = Color(0xFF00B8D4);
+const green = Color(0xFF19C784);
+const red = Color(0xFFE34B4B);
+const yellow = Color(0xFFFFC247);
+const muted = Color(0xFF9BA8B5);
 
-class Mach3Remote extends StatelessWidget {
-  const Mach3Remote({super.key});
+class Mach3App extends StatelessWidget {
+  const Mach3App({super.key});
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    debugShowCheckedModeBanner: false,
-    title: 'Mach3 Remote',
-    theme: ThemeData(
-      brightness: Brightness.dark,
-      scaffoldBackgroundColor: bg,
-      colorScheme: const ColorScheme.dark(primary: green),
-      useMaterial3: true,
-    ),
-    home: const MainScreen(),
-  );
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Mach3 Mill',
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: bg,
+        colorScheme: const ColorScheme.dark(
+          primary: accent,
+          surface: panel,
+        ),
+        useMaterial3: true,
+      ),
+      home: const Mach3Home(),
+    );
+  }
 }
 
-class MachineState {
-  final double x, y, z, feed, rpm;
-  final bool spindle;
+enum Motion { rapid, linear, clockwise, counterClockwise }
 
-  const MachineState(
-    this.x,
-    this.y,
-    this.z,
-    this.feed,
-    this.rpm,
-    this.spindle,
-  );
+class GCodeState {
+  double x = 0, y = 0, z = 0;
+  double feed = 100;
+  double spindle = 0;
+  bool metric = true;
+  bool absolute = true;
+  bool spindleOn = false;
+  bool spindleReverse = false;
+  int offset = 54;
+  Motion motion = Motion.rapid;
+
+  GCodeState copy() {
+    final s = GCodeState();
+    s.x = x;
+    s.y = y;
+    s.z = z;
+    s.feed = feed;
+    s.spindle = spindle;
+    s.metric = metric;
+    s.absolute = absolute;
+    s.spindleOn = spindleOn;
+    s.spindleReverse = spindleReverse;
+    s.offset = offset;
+    s.motion = motion;
+    return s;
+  }
 }
 
-class Move {
+class GCodeBlock {
   final int line;
-  final Offset start, end;
-  final double z0, z1;
-  final bool rapid;
-  final List<Offset> points;
+  final String source;
+  final GCodeState state;
+  final bool supported;
+  final String message;
 
-  const Move(
-    this.line,
-    this.start,
-    this.end,
-    this.z0,
-    this.z1,
-    this.rapid,
-    this.points,
-  );
-}
-
-class ParsedProgram {
-  final List<Move> moves;
-  final List<MachineState> states;
-  final double minX, maxX, minY, maxY;
-
-  const ParsedProgram(
-    this.moves,
-    this.states,
-    this.minX,
-    this.maxX,
-    this.minY,
-    this.maxY,
-  );
+  GCodeBlock({
+    required this.line,
+    required this.source,
+    required this.state,
+    required this.supported,
+    required this.message,
+  });
 }
 
 class GCodeParser {
-  static ParsedProgram parse(List<String> lines) {
-    double x = 0, y = 0, z = 0;
-    double unit = 1, f = 0, s = 0;
-    double minX = 0, maxX = 0, minY = 0, maxY = 0;
+  final List<GCodeBlock> blocks = [];
+  final List<String> errors = [];
 
-    bool absolute = true, spindle = false;
-    int motion = 0;
+  GCodeState parse(String source) {
+    blocks.clear();
+    errors.clear();
 
-    final moves = <Move>[];
-    final states = <MachineState>[];
+    final state = GCodeState();
+    final lines = source.split('\n');
 
-    final re = RegExp(
-      r'([A-Z])\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))',
-      caseSensitive: false,
-    );
-
-    for (var i = 0; i < lines.length; i++) {
-      final src = lines[i]
+    for (int i = 0; i < lines.length; i++) {
+      final original = lines[i];
+      final clean = original
           .replaceAll(RegExp(r'\([^)]*\)'), '')
           .split(';')
           .first
           .toUpperCase();
 
-      final w = <String, List<double>>{};
+      if (clean.trim().isEmpty) continue;
 
-      for (final m in re.allMatches(src)) {
-        final n = double.tryParse(m.group(2)!);
-        if (n != null) {
-          (w[m.group(1)!] ??= []).add(n);
-        }
-      }
-
-      double? v(String k) => w[k]?.last;
-
-      for (final g in w['G'] ?? <double>[]) {
-        if (g == 20) unit = 25.4;
-        if (g == 21) unit = 1;
-        if (g == 90) absolute = true;
-        if (g == 91) absolute = false;
-        if (g == 0) motion = 0;
-        if (g == 1) motion = 1;
-        if (g == 2) motion = 2;
-        if (g == 3) motion = 3;
-      }
-
-      if (v('F') != null) f = v('F')! * unit;
-      if (v('S') != null) s = v('S')!;
-
-      for (final m in w['M'] ?? <double>[]) {
-        if (m == 3 || m == 4) spindle = true;
-        if (m == 5) spindle = false;
-      }
-
-      final ox = x, oy = y, oz = z;
-
-      if (v('X') != null) {
-        x = absolute ? v('X')! * unit : x + v('X')! * unit;
-      }
-
-      if (v('Y') != null) {
-        y = absolute ? v('Y')! * unit : y + v('Y')! * unit;
-      }
-
-      if (v('Z') != null) {
-        z = absolute ? v('Z')! * unit : z + v('Z')! * unit;
-      }
-
-      if (x != ox || y != oy) {
-        final a = Offset(ox, oy);
-        final b = Offset(x, y);
-        final pts = <Offset>[a];
-
-        if ((motion == 2 || motion == 3) &&
-            (v('I') != null || v('J') != null)) {
-          final c = Offset(
-            ox + (v('I') ?? 0) * unit,
-            oy + (v('J') ?? 0) * unit,
-          );
-
-          final r = (a - c).distance;
-
-          if (r > 1e-6) {
-            final a0 = math.atan2(a.dy - c.dy, a.dx - c.dx);
-            final a1 = math.atan2(b.dy - c.dy, b.dx - c.dx);
-
-            var sw = a1 - a0;
-
-            if (motion == 2) {
-              while (sw >= 0) {
-                sw -= 2 * math.pi;
-              }
-            } else {
-              while (sw <= 0) {
-                sw += 2 * math.pi;
-              }
-            }
-
-            final count = math.max(
-              12,
-              (sw.abs() * r / 2).ceil(),
-            );
-
-            for (var j = 1; j <= count; j++) {
-              final q = a0 + sw * j / count;
-              pts.add(
-                Offset(
-                  c.dx + r * math.cos(q),
-                  c.dy + r * math.sin(q),
-                ),
-              );
-            }
-
-            pts[pts.length - 1] = b;
-          } else {
-            pts.add(b);
-          }
-        } else {
-          pts.add(b);
-        }
-
-        moves.add(
-          Move(i, a, b, oz, z, motion == 0, pts),
+      final words = RegExp(
+        r'([A-Z])\s*(-?(?:\d+\.?\d*|\.\d+))',
+      ).allMatches(clean).map((m) {
+        return MapEntry(
+          m.group(1)!,
+          double.parse(m.group(2)!),
         );
+      }).toList();
 
-        for (final p in pts) {
-          minX = math.min(minX, p.dx);
-          maxX = math.max(maxX, p.dx);
-          minY = math.min(minY, p.dy);
-          maxY = math.max(maxY, p.dy);
+      final before = state.copy();
+      bool supported = true;
+      final notes = <String>[];
+
+      // Modal G-codes
+      for (final word in words) {
+        if (word.key != 'G') continue;
+        final g = word.value;
+
+        if (g == 0) state.motion = Motion.rapid;
+        else if (g == 1) state.motion = Motion.linear;
+        else if (g == 2) state.motion = Motion.clockwise;
+        else if (g == 3) state.motion = Motion.counterClockwise;
+        else if (g == 17) {}
+        else if (g == 20) state.metric = false;
+        else if (g == 21) state.metric = true;
+        else if (g == 90) state.absolute = true;
+        else if (g == 91) state.absolute = false;
+        else if (g >= 54 && g <= 59) {
+          state.offset = g.toInt();
+        } else if (g == 4) {
+          notes.add('Dwell');
+        } else {
+          supported = false;
+          notes.add('G${g} غير مدعوم');
         }
       }
 
-      states.add(
-        MachineState(x, y, z, f, s, spindle),
-      );
+      double scale(double value) =>
+          state.metric ? value : value * 25.4;
+
+      double? value(String key) {
+        for (final w in words.reversed) {
+          if (w.key == key) return scale(w.value);
+        }
+        return null;
+      }
+
+      for (final w in words) {
+        if (w.key == 'F') {
+          state.feed = scale(w.value);
+        } else if (w.key == 'S') {
+          state.spindle = w.value;
+        } else if (w.key == 'M') {
+          if (w.value == 3) {
+            state.spindleOn = true;
+            state.spindleReverse = false;
+          } else if (w.value == 4) {
+            state.spindleOn = true;
+            state.spindleReverse = true;
+          } else if (w.value == 5) {
+            state.spindleOn = false;
+          } else if (![0, 1, 2, 6, 30].contains(w.value.toInt())) {
+            supported = false;
+            notes.add('M${w.value} غير مدعوم');
+          }
+        }
+      }
+
+      final xv = value('X');
+      final yv = value('Y');
+      final zv = value('Z');
+
+      if (state.absolute) {
+        if (xv != null) state.x = xv;
+        if (yv != null) state.y = yv;
+        if (zv != null) state.z = zv;
+      } else {
+        if (xv != null) state.x += xv;
+        if (yv != null) state.y += yv;
+        if (zv != null) state.z += zv;
+      }
+
+      if (words.any((w) => w.key == 'I' || w.key == 'J')) {
+        if (state.motion != Motion.clockwise &&
+            state.motion != Motion.counterClockwise) {
+          notes.add('I/J بدون حركة قوسية');
+        }
+      }
+
+      final changed = xv != null || yv != null || zv != null;
+      if (changed && state.motion == Motion.rapid) {
+        notes.add('G0');
+      } else if (changed && state.motion == Motion.linear) {
+        notes.add('G1');
+      } else if (changed) {
+        notes.add('Arc');
+      }
+
+      blocks.add(GCodeBlock(
+        line: i + 1,
+        source: original,
+        state: state.copy(),
+        supported: supported,
+        message: notes.join(' | '),
+      ));
+
+      if (!supported) errors.add('Line ${i + 1}: ${notes.join(', ')}');
     }
 
-    return ParsedProgram(
-      moves,
-      states,
-      minX,
-      maxX,
-      minY,
-      maxY,
-    );
+    return state;
   }
 }
 
-class MainScreen extends StatefulWidget {
-  const MainScreen({super.key});
+class Mach3Home extends StatefulWidget {
+  const Mach3Home({super.key});
 
   @override
-  State<MainScreen> createState() => _MainScreenState();
+  State<Mach3Home> createState() => _Mach3HomeState();
 }
 
-class _MainScreenState extends State<MainScreen> {
-  final names = [
-    'PROGRAM RUN',
-    'MDI',
-    'TOOL PATH',
-    'MANUAL JOG',
-    'OFFSETS',
-    'SETTINGS',
-    'DIAGNOSTICS',
-    'FILES',
-    'CONNECTION',
-  ];
-
-  int page = 0;
-
-  String ip = '192.168.1.100';
-  String port = '8765';
-  String fileName = 'لم يتم اختيار ملف';
-  String fileInfo = '';
-  String content = '';
-  String work = 'G54';
-  String step = '1.0';
-  String mdiStatus = 'جاهز';
-
-  final mdi = TextEditingController();
-  final scroll = ScrollController();
-
-  List<String> lines = [];
-  ParsedProgram? parsed;
-  Timer? timer;
-
-  final offsets = {
-    for (final c in ['G54', 'G55', 'G56', 'G57', 'G58', 'G59'])
-      c: {'X': 0.0, 'Y': 0.0, 'Z': 0.0},
-  };
-
-  final signals = <String, bool>{
-    'Emergency input': false,
-    'X Home': false,
-    'Y Home': false,
-    'Z Home': false,
-    'X Limit': false,
-    'Y Limit': false,
-    'Z Limit': false,
-    'Probe': false,
-    'Spindle': false,
-    'Flood': false,
-    'Mist': false,
-  };
-
-  int line = 0, done = 0;
+class _Mach3HomeState extends State<Mach3Home> {
+  int tab = 0;
 
   double mx = 0, my = 0, mz = 0;
-  double feed = 0, rpm = 0;
-  double fro = 100, sro = 100;
-  double jogSpeed = 50;
+  double wx = 0, wy = 0, wz = 0;
+
+  double feedOverride = 100;
+  double spindleOverride = 100;
+  double jogStep = 1;
+  double jogSpeed = 100;
+
+  double spindleRpm = 0;
+  bool spindleOn = false;
+  bool spindleReverse = false;
 
   bool running = false;
-  bool hold = false;
+  bool paused = false;
   bool estop = false;
-  bool spindle = false;
-  bool connected = false;
-  bool single = false;
-  bool soft = true;
-  bool blockDelete = false;
-  bool optionalStop = false;
-  bool flood = false;
-  bool mist = false;
-  bool offline = false;
 
-  double get wx => mx - offsets[work]!['X']!;
-  double get wy => my - offsets[work]!['Y']!;
-  double get wz => mz - offsets[work]!['Z']!;
+  int currentLine = 0;
+  int selectedOffset = 54;
+
+  String program = '';
+  String fileName = 'No file loaded';
+  String ip = '192.168.1.100';
+  String port = '8080';
+
+  final parser = GCodeParser();
+  List<GCodeBlock> blocks = [];
+  final Map<int, List<double>> offsets = {
+    54: [0, 0, 0],
+    55: [0, 0, 0],
+    56: [0, 0, 0],
+    57: [0, 0, 0],
+    58: [0, 0, 0],
+    59: [0, 0, 0],
+  };
 
   @override
   void initState() {
     super.initState();
-    _load();
+    loadSettings();
   }
 
-  Future<void> _load() async {
+  Future<void> loadSettings() async {
     final p = await SharedPreferences.getInstance();
-
-    if (mounted) {
-      setState(() {
-        ip = p.getString('ip') ?? ip;
-        port = p.getString('port') ?? port;
-      });
-    }
-  }
-
-  @override
-  void dispose() {
-    timer?.cancel();
-    scroll.dispose();
-    mdi.dispose();
-    super.dispose();
-  }
-
-  void msg(String s) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(s, textAlign: TextAlign.center),
-        ),
-      );
-    }
-  }
-
-  void zero(String a) {
-    if (estop) return;
-
     setState(() {
-      offsets[work]![a] =
-          a == 'X' ? mx : a == 'Y' ? my : mz;
+      ip = p.getString('ip') ?? ip;
+      port = p.getString('port') ?? port;
+      jogStep = p.getDouble('step') ?? jogStep;
+      jogSpeed = p.getDouble('jogSpeed') ?? jogSpeed;
     });
   }
 
-  void zeroAll() {
-    if (estop) return;
+  Future<void> saveSettings() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('ip', ip);
+    await p.setString('port', port);
+    await p.setDouble('step', jogStep);
+    await p.setDouble('jogSpeed', jogSpeed);
+  }
+
+  double get workX => mx - offsets[selectedOffset]![0];
+  double get workY => my - offsets[selectedOffset]![1];
+  double get workZ => mz - offsets[selectedOffset]![2];
+
+  void zeroAxis(String axis) {
+    final o = offsets[selectedOffset]!;
+    if (axis == 'X' || axis == 'ALL') o[0] = mx;
+    if (axis == 'Y' || axis == 'ALL') o[1] = my;
+    if (axis == 'Z' || axis == 'ALL') o[2] = mz;
+    setState(() {});
+  }
+
+  void jog(String axis, double direction) {
+    if (estop || running) return;
+    final amount = jogStep * direction;
 
     setState(() {
-      offsets[work]!['X'] = mx;
-      offsets[work]!['Y'] = my;
-      offsets[work]!['Z'] = mz;
+      if (axis == 'X') mx += amount;
+      if (axis == 'Y') my += amount;
+      if (axis == 'Z') mz += amount;
     });
   }
 
-  Future<void> pick() async {
-    final r = await FilePicker.platform.pickFiles(
+  Future<void> openFile() async {
+    final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['nc', 'tap', 'gcode', 'txt', 'cnc'],
+      allowedExtensions: ['nc', 'tap', 'gcode', 'txt', 'ngc'],
       withData: true,
     );
 
-    if (r == null || r.files.isEmpty) return;
+    if (result == null || result.files.single.bytes == null) return;
 
-    final f = r.files.first;
-
-    if (f.bytes == null) {
-      msg('تعذرت قراءة الملف');
-      return;
-    }
-
-    final c = String.fromCharCodes(f.bytes!);
-    final l = c.split(RegExp(r'\r?\n'));
-    final p = GCodeParser.parse(l);
-
-    timer?.cancel();
+    final file = result.files.single;
+    final content = String.fromCharCodes(file.bytes!);
 
     setState(() {
-      content = c;
-      lines = l;
-      parsed = p;
-      fileName = f.name;
-      fileInfo = '${(f.size / 1024).toStringAsFixed(1)} KB';
-
-      line = 0;
-      done = 0;
-
-      mx = 0;
-      my = 0;
-      mz = 0;
-
-      feed = 0;
-      rpm = 0;
-      spindle = false;
-
+      fileName = file.name;
+      program = content;
+      blocks = parser.parse(program).blocks;
+      currentLine = 0;
       running = false;
-      hold = false;
-    });
-
-    msg('تم تحميل الملف: ${p.moves.length} حركة XY');
-  }
-
-  void execute(int i) {
-    final p = parsed;
-
-    if (p == null || i < 0 || i >= p.states.length) return;
-
-    final s = p.states[i];
-
-    setState(() {
-      mx = s.x;
-      my = s.y;
-      mz = s.z;
-
-      feed = s.feed;
-      rpm = s.rpm;
-      spindle = s.spindle;
-
-      done = p.moves.where((m) => m.line <= i).length;
+      paused = false;
     });
   }
 
-  void start() {
-    if (estop) {
-      msg('ألغِ حالة الطوارئ التجريبية');
-      return;
-    }
-
-    if (lines.isEmpty) {
-      msg('اختر ملف G-code');
-      return;
-    }
-
-    if (running && hold) {
-      setState(() => hold = false);
-      return;
-    }
-
-    if (line >= lines.length) {
-      setState(() {
-        line = 0;
-        done = 0;
-        mx = 0;
-        my = 0;
-        mz = 0;
-      });
-    }
-
-    timer?.cancel();
+  void startProgram() {
+    if (estop || blocks.isEmpty) return;
+    if (currentLine >= blocks.length) currentLine = 0;
 
     setState(() {
       running = true;
-      hold = false;
+      paused = false;
     });
 
-    timer = Timer.periodic(
-      const Duration(milliseconds: 350),
-      (t) {
-        if (!mounted || hold || estop) return;
-
-        if (line >= lines.length) {
-          t.cancel();
-
-          setState(() {
-            running = false;
-          });
-
-          msg('انتهت المحاكاة');
-          return;
-        }
-
-        execute(line);
-
-        setState(() {
-          line++;
-        });
-
-        if (scroll.hasClients) {
-          scroll.animateTo(
-            (line * 22).clamp(
-              0,
-              scroll.position.maxScrollExtent,
-            ),
-            duration: const Duration(milliseconds: 100),
-            curve: Curves.easeOut,
-          );
-        }
-
-        if (single) {
-          setState(() => hold = true);
-        }
-      },
-    );
-
-    msg('بدأت المحاكاة');
+    executeNext();
   }
 
-  void stop() {
-    timer?.cancel();
+  Future<void> executeNext() async {
+    while (running && !paused && !estop &&
+        currentLine < blocks.length) {
+      final block = blocks[currentLine];
 
-    setState(() {
-      running = false;
-      hold = false;
-      line = 0;
-      done = 0;
-      spindle = false;
-    });
-  }
+      await Future.delayed(const Duration(milliseconds: 250));
 
-  void jog(String a, double d) {
-    if (estop || (running && !hold)) {
-      msg('الحركة اليدوية غير متاحة');
-      return;
+      if (!mounted || !running || paused || estop) return;
+
+      setState(() {
+        mx = block.state.x;
+        my = block.state.y;
+        mz = block.state.z;
+        spindleRpm = block.state.spindle;
+        spindleOn = block.state.spindleOn;
+        spindleReverse = block.state.spindleReverse;
+        currentLine++;
+      });
     }
 
-    final n = (double.tryParse(step) ?? 1) * d;
+    if (mounted && currentLine >= blocks.length) {
+      setState(() {
+        running = false;
+        paused = false;
+      });
+    }
+  }
 
+  void holdProgram() {
     setState(() {
-      if (a == 'X') mx += n;
-      if (a == 'Y') my += n;
-      if (a == 'Z') mz += n;
+      paused = true;
+      running = false;
     });
   }
 
-  void runMdi() {
-    final c = mdi.text.trim().toUpperCase();
-
-    if (c.isEmpty || estop) return;
-
-    final p = GCodeParser.parse([c]);
-    final s = p.states.first;
-
+  void stopProgram() {
     setState(() {
-      mx = s.x;
-      my = s.y;
-      mz = s.z;
-      feed = s.feed;
-      rpm = s.rpm;
-      spindle = s.spindle;
-      mdiStatus = 'تم تفسير الأمر محليًا: $c';
+      running = false;
+      paused = false;
+      currentLine = 0;
+      spindleOn = false;
     });
-
-    mdi.clear();
   }
 
-  Future<void> connSettings() async {
-    final a = TextEditingController(text: ip);
-    final b = TextEditingController(text: port);
+  void emergencyStop() {
+    setState(() {
+      estop = true;
+      running = false;
+      paused = false;
+      spindleOn = false;
+    });
+  }
 
-    await showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('إعداد الاتصال'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: a,
-              decoration: const InputDecoration(labelText: 'IP'),
+  void resetEmergency() {
+    setState(() => estop = false);
+  }
+
+  Widget numberBox(String label, double value,
+      {Color color = Colors.white}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 7),
+      decoration: BoxDecoration(
+        color: Colors.black,
+        border: Border.all(color: panel2),
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Column(
+        children: [
+          Text(label, style: const TextStyle(color: muted, fontSize: 12)),
+          const SizedBox(height: 4),
+          FittedBox(
+            child: Text(
+              value.toStringAsFixed(3),
+              style: TextStyle(
+                color: color,
+                fontSize: 23,
+                fontWeight: FontWeight.bold,
+                fontFamily: 'monospace',
+              ),
             ),
-            TextField(
-              controller: b,
-              decoration: const InputDecoration(labelText: 'Port'),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('إلغاء'),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              final n = int.tryParse(b.text);
-
-              if (a.text.trim().isEmpty ||
-                  n == null ||
-                  n < 1 ||
-                  n > 65535) {
-                msg('راجع IP وPort');
-                return;
-              }
-
-              final p = await SharedPreferences.getInstance();
-
-              await p.setString('ip', a.text.trim());
-              await p.setString('port', b.text.trim());
-
-              if (mounted) {
-                setState(() {
-                  ip = a.text.trim();
-                  port = b.text.trim();
-                });
-              }
-
-              if (ctx.mounted) Navigator.pop(ctx);
-            },
-            child: const Text('حفظ'),
           ),
         ],
       ),
     );
-
-    a.dispose();
-    b.dispose();
   }
 
-  Widget box(String title, Widget child) {
+  Widget coordinates() {
+    return Row(
+      children: [
+        Expanded(child: numberBox('X', workX, color: Colors.redAccent)),
+        const SizedBox(width: 5),
+        Expanded(child: numberBox('Y', workY, color: green)),
+        const SizedBox(width: 5),
+        Expanded(child: numberBox('Z', workZ, color: accent)),
+      ],
+    );
+  }
+
+  Widget machineCoordinates() {
+    return Row(
+      children: [
+        Expanded(child: numberBox('MACHINE X', mx)),
+        const SizedBox(width: 5),
+        Expanded(child: numberBox('MACHINE Y', my)),
+        const SizedBox(width: 5),
+        Expanded(child: numberBox('MACHINE Z', mz)),
+      ],
+    );
+  }
+
+  Widget section(String title, Widget child) {
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(13),
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
         color: panel,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white12),
+        borderRadius: BorderRadius.circular(7),
+        border: Border.all(color: panel2),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            title,
-            style: const TextStyle(
-              color: green,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
+          Text(title,
+              style: const TextStyle(
+                  color: accent, fontWeight: FontWeight.bold)),
           const SizedBox(height: 10),
           child,
         ],
@@ -639,643 +480,485 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  Widget btn(
-    String s,
-    VoidCallback f, {
-    Color color = const Color(0xFF344452),
+  Widget actionButton(
+    String label,
+    VoidCallback action, {
+    Color color = panel2,
+    double height = 45,
   }) {
     return SizedBox(
-      width: double.infinity,
-      height: 45,
+      height: height,
       child: ElevatedButton(
-        onPressed: f,
         style: ElevatedButton.styleFrom(
           backgroundColor: color,
           foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(5)),
         ),
-        child: Text(s, textAlign: TextAlign.center),
+        onPressed: action,
+        child: FittedBox(
+          child: Text(label,
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+        ),
       ),
     );
   }
 
-  Widget val(String s, double v) {
-    return Expanded(
-      child: Container(
-        margin: const EdgeInsets.symmetric(horizontal: 3),
-        padding: const EdgeInsets.all(9),
-        decoration: BoxDecoration(
-          color: bg,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Column(
+  Widget sliderControl(
+      String label, double value, double min, double max,
+      ValueChanged<double> change) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(s, style: const TextStyle(color: orange)),
-            Text(
-              v.toStringAsFixed(4),
-              style: const TextStyle(
-                color: green,
-                fontFamily: 'monospace',
-              ),
-            ),
+            Text(label),
+            Text('${value.toStringAsFixed(0)}%',
+                style: const TextStyle(color: accent)),
           ],
         ),
-      ),
+        Slider(
+          value: value.clamp(min, max),
+          min: min,
+          max: max,
+          onChanged: (v) => setState(() => change(v)),
+        ),
+      ],
     );
   }
 
-  Widget coords(String t, double x, double y, double z) {
-    return box(
-      t,
-      Row(
-        children: [
-          val('X', x),
-          val('Y', y),
-          val('Z', z),
-        ],
-      ),
-    );
-  }
-
-  Widget zeros() {
-    return box(
-      'ZERO AXIS',
-      Column(
-        children: [
-          Row(
-            children: ['X', 'Y', 'Z'].map((a) {
-              return Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.all(3),
-                  child: btn('ZERO $a', () => zero(a)),
+  Widget programScreen() {
+    return ListView(
+      padding: const EdgeInsets.all(10),
+      children: [
+        section('WORK COORDINATES', coordinates()),
+        section('MACHINE COORDINATES', machineCoordinates()),
+        section('TOOLPATH PREVIEW', SizedBox(
+          height: 180,
+          child: CustomPaint(
+            painter: ToolpathPainter(blocks, currentLine),
+            child: const Center(
+              child: Text('XY TOOLPATH',
+                  style: TextStyle(color: muted, fontSize: 10)),
+            ),
+          ),
+        )),
+        section('PROGRAM CONTROL',
+          Column(children: [
+            Row(children: [
+              Expanded(child: actionButton(
+                  'CYCLE START', startProgram, color: green)),
+              const SizedBox(width: 6),
+              Expanded(child: actionButton(
+                  'FEED HOLD', holdProgram, color: yellow)),
+              const SizedBox(width: 6),
+              Expanded(child: actionButton(
+                  'STOP', stopProgram, color: red)),
+            ]),
+            const SizedBox(height: 8),
+            Text('FILE: $fileName',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis),
+            Text('LINE: $currentLine / ${blocks.length}'),
+            Text(running ? 'RUNNING' :
+                paused ? 'PAUSED' : 'IDLE',
+                style: TextStyle(
+                    color: running ? green : yellow,
+                    fontWeight: FontWeight.bold)),
+          ]),
+        ),
+        section('FEED RATE OVERRIDE',
+            sliderControl('FEED', feedOverride, 0, 150,
+                (v) => feedOverride = v)),
+        section('SPINDLE',
+          Column(children: [
+            Text('${spindleRpm.toStringAsFixed(0)} RPM',
+                style: const TextStyle(fontSize: 25)),
+            Row(children: [
+              Expanded(child: actionButton('SPINDLE CW', () {
+                setState(() {
+                  spindleOn = true;
+                  spindleReverse = false;
+                });
+              }, color: green)),
+              const SizedBox(width: 6),
+              Expanded(child: actionButton('SPINDLE CCW', () {
+                setState(() {
+                  spindleOn = true;
+                  spindleReverse = true;
+                });
+              }, color: accent)),
+              const SizedBox(width: 6),
+              Expanded(child: actionButton('SPINDLE STOP', () {
+                setState(() => spindleOn = false);
+              }, color: red)),
+            ]),
+            sliderControl('SPINDLE OVERRIDE', spindleOverride,
+                0, 150, (v) => spindleOverride = v),
+            Text(spindleOn
+                ? (spindleReverse ? 'REVERSE' : 'FORWARD')
+                : 'STOPPED'),
+          ]),
+        ),
+        section('G-CODE PREVIEW', SizedBox(
+          height: 220,
+          child: ListView.builder(
+            itemCount: blocks.length,
+            itemBuilder: (context, index) {
+              final b = blocks[index];
+              return Container(
+                color: index + 1 == currentLine
+                    ? Colors.blueGrey.withOpacity(.5)
+                    : Colors.transparent,
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Text(
+                  '${b.line.toString().padLeft(3)}  ${b.source}',
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    color: b.supported ? Colors.white : red,
+                  ),
                 ),
               );
-            }).toList(),
+            },
           ),
-          btn(
-            'ZERO ALL',
-            zeroAll,
-            color: const Color(0xFF167A42),
-          ),
-        ],
+        )),
+        if (parser.errors.isNotEmpty)
+          section('UNSUPPORTED COMMANDS',
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: parser.errors.map((e) =>
+                Text(e, style: const TextStyle(color: red))).toList(),
+            )),
+      ],
+    );
+  }
+
+  Widget jogButton(String label, String axis, double direction) {
+    return SizedBox(
+      width: 75,
+      height: 60,
+      child: ElevatedButton(
+        onPressed: () => setState(() => jog(axis, direction)),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: panel2,
+          foregroundColor: Colors.white,
+        ),
+        child: Text(label,
+            style: const TextStyle(
+                fontSize: 20, fontWeight: FontWeight.bold)),
       ),
     );
   }
 
-  Widget program() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      box(
-        'PROGRAM FILE',
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(fileName),
-            Text(fileInfo),
-            btn('LOAD G-CODE', pick),
-          ],
-        ),
-      ),
-      coords('WORK COORDINATES - $work', wx, wy, wz),
-      box(
-        'PROGRAM RUN',
-        Column(
-          children: [
+  Widget jogScreen() {
+    return ListView(
+      padding: const EdgeInsets.all(10),
+      children: [
+        section('WORK COORDINATES', coordinates()),
+        section('MACHINE COORDINATES', machineCoordinates()),
+        section('XY JOG',
+          Column(children: [
+            jogButton('Y+', 'Y', 1),
             Row(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Expanded(
-                  child: btn(
-                    hold ? 'RESUME' : 'CYCLE START',
-                    start,
-                    color: const Color(0xFF167A42),
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: btn(
-                    'FEED HOLD',
-                    () => setState(() => hold = true),
-                    color: const Color(0xFF96701F),
-                  ),
-                ),
+                jogButton('X-', 'X', -1),
+                const SizedBox(width: 20),
+                jogButton('X+', 'X', 1),
               ],
             ),
-            btn('STOP', stop, color: Colors.red.shade900),
-            LinearProgressIndicator(
-              value: lines.isEmpty ? 0 : line / lines.length,
-            ),
-            Text('Line $line / ${lines.length}'),
-          ],
+            jogButton('Y-', 'Y', -1),
+          ]),
         ),
-      ),
-      box(
-        'FEED RATE',
-        Column(
-          children: [
-            Text(
-              'F ${feed.toStringAsFixed(2)} | Actual ${(feed * fro / 100).toStringAsFixed(2)}',
-            ),
-            Text('FRO ${fro.toInt()}%'),
-            Slider(
-              value: fro,
-              min: 10,
-              max: 150,
-              onChanged: (v) => setState(() => fro = v),
-            ),
-          ],
-        ),
-      ),
-      box(
-        'SPINDLE',
-        Column(
-          children: [
-            Text(
-              'S ${rpm.toStringAsFixed(0)} RPM | Actual ${(spindle ? rpm * sro / 100 : 0).toStringAsFixed(0)}',
-            ),
-            Row(
-              children: [
-                Expanded(
-                  child: btn(
-                    'SPINDLE ON',
-                    () => setState(() => spindle = true),
-                  ),
-                ),
-                Expanded(
-                  child: btn(
-                    'SPINDLE OFF',
-                    () => setState(() => spindle = false),
-                  ),
-                ),
-              ],
-            ),
-            Text('Override ${sro.toInt()}%'),
-            Slider(
-              value: sro,
-              min: 50,
-              max: 150,
-              onChanged: (v) => setState(() => sro = v),
-            ),
-          ],
-        ),
-      ),
-      box(
-        'G-CODE LINES',
-        SizedBox(
-          height: 230,
-          child: lines.isEmpty
-              ? const Center(child: Text('لا يوجد ملف'))
-              : ListView.builder(
-                  controller: scroll,
-                  itemCount: lines.length,
-                  itemExtent: 22,
-                  itemBuilder: (c, i) => Container(
-                    color: i == line - 1
-                        ? green.withOpacity(.2)
-                        : null,
-                    child: Text(
-                      '${i + 1}: ${lines[i]}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontFamily: 'monospace',
-                      ),
-                    ),
-                  ),
-                ),
-        ),
-      ),
-    ],
-  );
-
-  Widget mdiPage() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      coords('MACHINE COORDINATES', mx, my, mz),
-      coords('WORK COORDINATES', wx, wy, wz),
-      box(
-        'MDI INPUT',
-        Column(
-          children: [
-            TextField(
-              controller: mdi,
-              decoration: const InputDecoration(
-                hintText: 'G0 X10 Y20 Z5',
-                border: OutlineInputBorder(),
-              ),
-              onSubmitted: (_) => runMdi(),
-            ),
-            btn(
-              'EXECUTE',
-              runMdi,
-              color: const Color(0xFF167A42),
-            ),
-            Text(mdiStatus),
-          ],
-        ),
-      ),
-      box(
-        'QUICK COMMANDS',
-        Wrap(
-          spacing: 5,
-          children: [
-            'G90',
-            'G91',
-            'G20',
-            'G21',
-            'M3',
-            'M5',
-            'G54',
-            'G0 X0 Y0 Z0',
-          ].map((s) {
-            return ActionChip(
-              label: Text(s),
-              onPressed: () {
-                mdi.text = s;
-                runMdi();
-              },
-            );
-          }).toList(),
-        ),
-      ),
-    ],
-  );
-
-  Widget toolpath() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      coords('MACHINE COORDINATES', mx, my, mz),
-      box(
-        'PROGRAM LIMITS',
-        Text(
-          'X ${parsed?.minX.toStringAsFixed(4) ?? "0"} to ${parsed?.maxX.toStringAsFixed(4) ?? "0"} | Y ${parsed?.minY.toStringAsFixed(4) ?? "0"} to ${parsed?.maxY.toStringAsFixed(4) ?? "0"}',
-        ),
-      ),
-      box(
-        'TOOLPATH DISPLAY',
-        SizedBox(
-          height: 340,
-          child: CustomPaint(
-            painter: PathPainter(
-              parsed,
-              done,
-              Offset(mx, my),
-            ),
-            child: parsed == null
-                ? const Center(child: Text('حمّل ملف G-code'))
-                : null,
+        section('Z JOG',
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              jogButton('Z+', 'Z', 1),
+              const SizedBox(width: 15),
+              jogButton('Z-', 'Z', -1),
+            ],
           ),
         ),
-      ),
-      box(
-        'TOOLPATH CONTROL',
-        Column(
-          children: [
-            btn(
-              'REGENERATE TOOLPATH',
-              () => setState(() {
-                parsed = GCodeParser.parse(lines);
-              }),
+        section('JOG SETTINGS',
+          Column(children: [
+            const Text('JOG STEP'),
+            Wrap(
+              spacing: 6,
+              children: [0.001, 0.01, 0.1, 1, 10].map((v) =>
+                ChoiceChip(
+                  label: Text('$v'),
+                  selected: jogStep == v,
+                  onSelected: (_) => setState(() => jogStep = v),
+                )).toList(),
             ),
-            btn('SIMULATE RUN', start),
-            btn('RUN FROM HERE', start),
-            btn('REWIND', stop),
-            SwitchListTile(
-              title: const Text('Single Block'),
-              value: single,
-              onChanged: (v) => setState(() => single = v),
-            ),
-          ],
-        ),
-      ),
-    ],
-  );
-
-  Widget jogPage() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      coords('MACHINE COORDINATES', mx, my, mz),
-      coords('WORK COORDINATES', wx, wy, wz),
-      box(
-        'JOG STEP',
-        DropdownButtonFormField<String>(
-          value: step,
-          items: ['0.001', '0.01', '0.1', '1.0', '10.0']
-              .map(
-                (s) => DropdownMenuItem(
-                  value: s,
-                  child: Text('$s mm'),
-                ),
-              )
-              .toList(),
-          onChanged: (v) => setState(() => step = v ?? step),
-        ),
-      ),
-      box(
-        'JOG CONTROL',
-        Column(
-          children: ['X', 'Y', 'Z'].map((a) {
-            return Row(
-              children: [
-                Expanded(child: Text(a)),
-                Expanded(child: btn('−', () => jog(a, -1))),
-                Expanded(child: btn('+', () => jog(a, 1))),
-              ],
-            );
-          }).toList(),
-        ),
-      ),
-      box(
-        'JOG SPEED',
-        Column(
-          children: [
-            Text('${jogSpeed.toInt()}%'),
+            const SizedBox(height: 8),
+            Text('JOG SPEED: ${jogSpeed.toStringAsFixed(0)}%'),
             Slider(
               value: jogSpeed,
               min: 1,
               max: 100,
               onChanged: (v) => setState(() => jogSpeed = v),
             ),
-          ],
+          ]),
         ),
-      ),
-      zeros(),
-    ],
-  );
-
-  Widget offsetsPage() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      coords('MACHINE COORDINATES', mx, my, mz),
-      coords('WORK COORDINATES', wx, wy, wz),
-      box(
-        'WORK OFFSET',
-        DropdownButtonFormField<String>(
-          value: work,
-          items: offsets.keys.map((s) {
-            return DropdownMenuItem(
-              value: s,
-              child: Text(s),
-            );
-          }).toList(),
-          onChanged: (v) => setState(() => work = v ?? work),
-        ),
-      ),
-      box(
-        'OFFSET VALUES',
-        Row(
-          children: [
-            val('X', offsets[work]!['X']!),
-            val('Y', offsets[work]!['Y']!),
-            val('Z', offsets[work]!['Z']!),
-          ],
-        ),
-      ),
-      zeros(),
-      box(
-        'TOOL OFFSET',
-        btn(
-          'TOOL ZERO (SIMULATION)',
-          () => zero('Z'),
-        ),
-      ),
-    ],
-  );
-
-  Widget settingsPage() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      box(
-        'GENERAL',
-        Column(
-          children: [
-            SwitchListTile(
-              title: const Text('Soft Limits (local simulation)'),
-              value: soft,
-              onChanged: (v) => setState(() => soft = v),
-            ),
-            SwitchListTile(
-              title: const Text('Offline'),
-              value: offline,
-              onChanged: (v) => setState(() => offline = v),
-            ),
-            SwitchListTile(
-              title: const Text('Block Delete'),
-              value: blockDelete,
-              onChanged: (v) => setState(() => blockDelete = v),
-            ),
-            SwitchListTile(
-              title: const Text('Optional Stop'),
-              value: optionalStop,
-              onChanged: (v) => setState(() => optionalStop = v),
-            ),
-            SwitchListTile(
-              title: const Text('Single Block'),
-              value: single,
-              onChanged: (v) => setState(() => single = v),
-            ),
-          ],
-        ),
-      ),
-      box(
-        'COOLANT',
-        Column(
-          children: [
-            SwitchListTile(
-              title: const Text('Flood'),
-              value: flood,
-              onChanged: (v) => setState(() => flood = v),
-            ),
-            SwitchListTile(
-              title: const Text('Mist'),
-              value: mist,
-              onChanged: (v) => setState(() => mist = v),
-            ),
-          ],
-        ),
-      ),
-      box(
-        'MACHINE CONFIGURATION',
-        const Text(
-          'Port & Pins وMotor Tuning وHoming وSpindle Pulley تحتاج نقل إعدادات Mach3 الأصلية والتحقق منها. هذه الشاشة لا تغيّر إعدادات الكمبيوتر.',
-        ),
-      ),
-    ],
-  );
-
-  Widget diagnostics() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      coords('MACHINE POSITION', mx, my, mz),
-      coords('WORK POSITION', wx, wy, wz),
-      box(
-        'INPUT / OUTPUT STATUS (SIMULATED)',
-        Column(
-          children: signals.keys.map((k) {
-            return SwitchListTile(
-              title: Text(k),
-              value: signals[k]!,
-              onChanged: (v) => setState(() => signals[k] = v),
-            );
-          }).toList(),
-        ),
-      ),
-      box(
-        'STATUS',
-        Text(
-          'Program: ${running ? (hold ? "Feed Hold" : "Running") : "Idle"}\n'
-          'Spindle: ${spindle ? "ON" : "OFF"}\n'
-          'Emergency: ${estop ? "ACTIVE" : "CLEAR"}\n'
-          'Connection: ${connected ? "SIMULATED" : "NOT CONNECTED"}',
-        ),
-      ),
-      box(
-        'WARNING',
-        const Text(
-          'هذه المؤشرات تجريبية وليست قراءة من لوحة Mach3. زر الطوارئ المادي المستقل ضروري.',
-        ),
-      ),
-    ],
-  );
-
-  Widget files() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      box(
-        'G-CODE FILE',
-        Column(
-          children: [
-            Text(fileName),
-            Text(fileInfo),
-            btn('SELECT FILE', pick),
-            btn(
-              'PREPARE FOR MACH3',
-              () => msg('الإرسال الحقيقي غير مربوط'),
-            ),
-            btn(
-              'OPEN PROGRAM RUN',
-              () => setState(() => page = 0),
-            ),
-          ],
-        ),
-      ),
-      box(
-        'FILE CONTENT',
-        SizedBox(
-          height: 350,
-          child: SingleChildScrollView(
-            child: SelectableText(
-              content,
-              style: const TextStyle(fontFamily: 'monospace'),
-            ),
+        section('ZERO WORK AXIS',
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: ['X', 'Y', 'Z', 'ALL'].map((axis) =>
+              SizedBox(
+                width: 75,
+                child: actionButton('ZERO $axis',
+                    () => setState(() => zeroAxis(axis)),
+                    color: accent),
+              )).toList(),
           ),
         ),
-      ),
-    ],
-  );
+      ],
+    );
+  }
 
-  Widget connection() => ListView(
-    padding: const EdgeInsets.all(12),
-    children: [
-      box(
-        'WINDOWS COMPUTER',
-        Column(
-          children: [
-            Text('IP: $ip'),
-            Text('Port: $port'),
-            btn('EDIT SETTINGS', connSettings),
-          ],
+  Widget offsetsScreen() {
+    return ListView(
+      padding: const EdgeInsets.all(10),
+      children: [
+        section('MACHINE POSITION', machineCoordinates()),
+        section('WORK POSITION', coordinates()),
+        section('WORK OFFSET SELECT',
+          Wrap(
+            spacing: 6,
+            children: [54, 55, 56, 57, 58, 59].map((n) =>
+              ChoiceChip(
+                label: Text('G$n'),
+                selected: selectedOffset == n,
+                onSelected: (_) => setState(() => selectedOffset = n),
+              )).toList(),
+          ),
         ),
-      ),
-      box(
-        'CONNECTION',
-        Column(
-          children: [
-            Text(connected ? 'اتصال تجريبي' : 'غير متصل'),
-            btn(
-              connected ? 'DISCONNECT' : 'CONNECT (SIMULATED)',
-              () => setState(() => connected = !connected),
+        section('CURRENT OFFSET G$selectedOffset',
+          Column(children: [
+            numberBox('OFFSET X', offsets[selectedOffset]![0]),
+            const SizedBox(height: 5),
+            numberBox('OFFSET Y', offsets[selectedOffset]![1]),
+            const SizedBox(height: 5),
+            numberBox('OFFSET Z', offsets[selectedOffset]![2]),
+          ]),
+        ),
+        section('ZERO WORK COORDINATES',
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: ['X', 'Y', 'Z', 'ALL'].map((axis) =>
+              SizedBox(
+                width: 75,
+                child: actionButton('ZERO $axis',
+                    () => setState(() => zeroAxis(axis)),
+                    color: accent),
+              )).toList(),
+          ),
+        ),
+        section('TOOL ZERO',
+          actionButton('SET TOOL ZERO (Z)',
+              () => setState(() => zeroAxis('Z')),
+              color: yellow),
+        ),
+      ],
+    );
+  }
+
+  Widget filesScreen() {
+    return ListView(
+      padding: const EdgeInsets.all(10),
+      children: [
+        section('G-CODE FILE',
+          Column(children: [
+            Text(fileName,
+                style: const TextStyle(fontSize: 16)),
+            const SizedBox(height: 10),
+            actionButton('OPEN G-CODE FILE', openFile,
+                color: accent),
+            const SizedBox(height: 8),
+            actionButton('CLEAR PROGRAM', () {
+              setState(() {
+                program = '';
+                fileName = 'No file loaded';
+                blocks.clear();
+                currentLine = 0;
+              });
+            }, color: red),
+          ]),
+        ),
+        section('PROGRAM INFORMATION',
+          Column(crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Lines: ${blocks.length}'),
+              Text('Current line: $currentLine'),
+              Text('Unsupported commands: ${parser.errors.length}'),
+              const SizedBox(height: 10),
+              const Text('PROGRAM CONTENT',
+                  style: TextStyle(color: accent)),
+              Container(
+                height: 300,
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                color: Colors.black,
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    program.isEmpty ? 'No program loaded' : program,
+                    style: const TextStyle(
+                        fontFamily: 'monospace', fontSize: 12),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget connectionScreen() {
+    final ipController = TextEditingController(text: ip);
+    final portController = TextEditingController(text: port);
+
+    return ListView(
+      padding: const EdgeInsets.all(10),
+      children: [
+        section('MACH3 CONNECTION',
+          Column(children: [
+            TextField(
+              controller: ipController,
+              decoration: const InputDecoration(
+                labelText: 'Windows PC IP Address',
+              ),
             ),
-          ],
+            TextField(
+              controller: portController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'Port'),
+            ),
+            const SizedBox(height: 12),
+            actionButton('SAVE SETTINGS', () {
+              setState(() {
+                ip = ipController.text;
+                port = portController.text;
+              });
+              saveSettings();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Settings saved')),
+              );
+            }, color: accent),
+          ]),
         ),
-      ),
-      box(
-        'PROTOCOL',
-        const Text(
-          'WebSocket غير مربوط. يلزم برنامج وسيط على Windows للتواصل مع Mach3.',
+        section('CONNECTION STATUS',
+          const Column(children: [
+            Icon(Icons.link_off, color: yellow, size: 38),
+            Text('NOT CONNECTED'),
+            Text('Windows communication service is not configured.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: muted)),
+          ]),
         ),
-      ),
-    ],
-  );
+        section('SYSTEM INFORMATION',
+          const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Controller: Android'),
+              Text('Target: Mach3 on Windows'),
+              Text('Protocol: WebSocket (planned)'),
+              Text('Connection: Not active'),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
 
-  Widget current() {
-    return [
-      program,
-      mdiPage,
-      toolpath,
-      jogPage,
-      offsetsPage,
-      settingsPage,
-      diagnostics,
-      files,
-      connection,
-    ][page]();
+  Widget screen() {
+    switch (tab) {
+      case 0: return programScreen();
+      case 1: return jogScreen();
+      case 2: return offsetsScreen();
+      case 3: return filesScreen();
+      default: return connectionScreen();
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(names[page]),
+        backgroundColor: panel,
+        title: const Text('MACH3 MILL',
+            style: TextStyle(
+                fontWeight: FontWeight.bold, letterSpacing: 2)),
         actions: [
-          IconButton(
-            onPressed: () => setState(() => estop = !estop),
-            icon: Icon(
-              estop ? Icons.lock_open : Icons.warning,
-              color: estop ? green : red,
+          Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: Center(
+              child: Text(
+                estop ? 'ESTOP ACTIVE' : 'OFFLINE',
+                style: TextStyle(
+                  color: estop ? red : yellow,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
             ),
           ),
         ],
       ),
-      body: SafeArea(child: current()),
+      body: Column(children: [
+        Expanded(child: screen()),
+        Container(
+          color: Colors.black,
+          padding: const EdgeInsets.all(6),
+          child: Row(children: [
+            Expanded(
+              child: SizedBox(
+                height: 52,
+                child: ElevatedButton(
+                  onPressed: estop ? resetEmergency : emergencyStop,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: estop ? green : red,
+                    foregroundColor: Colors.white,
+                  ),
+                  child: Text(estop ? 'RESET ESTOP' : 'EMERGENCY STOP',
+                      style: const TextStyle(
+                          fontWeight: FontWeight.bold)),
+                ),
+              ),
+            ),
+          ]),
+        ),
+      ]),
       bottomNavigationBar: NavigationBar(
-        selectedIndex: page,
-        onDestinationSelected: (v) => setState(() => page = v),
-        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+        selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        backgroundColor: panel,
+        indicatorColor: accent.withOpacity(.2),
         destinations: const [
           NavigationDestination(
-            icon: Icon(Icons.play_arrow),
-            label: 'Run',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.keyboard),
-            label: 'MDI',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.route),
-            label: 'Path',
+            icon: Icon(Icons.play_circle_outline),
+            label: 'PROGRAM',
           ),
           NavigationDestination(
             icon: Icon(Icons.gamepad),
-            label: 'Jog',
+            label: 'JOG',
           ),
           NavigationDestination(
             icon: Icon(Icons.tune),
-            label: 'Offsets',
+            label: 'OFFSETS',
           ),
           NavigationDestination(
-            icon: Icon(Icons.settings),
-            label: 'Settings',
+            icon: Icon(Icons.folder_open),
+            label: 'FILES',
           ),
           NavigationDestination(
-            icon: Icon(Icons.monitor_heart),
-            label: 'Diag',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.folder),
-            label: 'Files',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.wifi),
-            label: 'Connect',
+            icon: Icon(Icons.settings_ethernet),
+            label: 'CONNECT',
           ),
         ],
       ),
@@ -1283,85 +966,81 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
-class PathPainter extends CustomPainter {
-  final ParsedProgram? data;
-  final int done;
-  final Offset position;
+class ToolpathPainter extends CustomPainter {
+  final List<GCodeBlock> blocks;
+  final int currentLine;
 
-  PathPainter(this.data, this.done, this.position);
+  ToolpathPainter(this.blocks, this.currentLine);
 
   @override
-  void paint(Canvas c, Size s) {
-    final d = data;
+  void paint(Canvas canvas, Size size) {
+    final bgPaint = Paint()..color = Colors.black;
+    canvas.drawRect(Offset.zero & size, bgPaint);
 
-    if (d == null || d.moves.isEmpty) return;
+    final grid = Paint()
+      ..color = Colors.white12
+      ..strokeWidth = .5;
 
-    final rx = math.max(.001, d.maxX - d.minX);
-    final ry = math.max(.001, d.maxY - d.minY);
+    for (double x = 0; x < size.width; x += 20) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
+    }
+    for (double y = 0; y < size.height; y += 20) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
+    }
 
-    final scale = math.min(
-      (s.width - 40) / rx,
-      (s.height - 40) / ry,
+    if (blocks.isEmpty) return;
+
+    final xs = blocks.map((b) => b.state.x);
+    final ys = blocks.map((b) => b.state.y);
+
+    final minX = xs.reduce(math.min);
+    final maxX = xs.reduce(math.max);
+    final minY = ys.reduce(math.min);
+    final maxY = ys.reduce(math.max);
+
+    final dx = (maxX - minX).abs() < .001 ? 1.0 : maxX - minX;
+    final dy = (maxY - minY).abs() < .001 ? 1.0 : maxY - minY;
+
+    Offset point(GCodeState s) => Offset(
+      12 + (s.x - minX) / dx * (size.width - 24),
+      size.height - 12 - (s.y - minY) / dy * (size.height - 24),
     );
 
-    final w = rx * scale;
-    final h = ry * scale;
+    final path = Path();
+    bool first = true;
+    Offset previous = Offset.zero;
 
-    final l = (s.width - w) / 2;
-    final t = (s.height - h) / 2;
+    for (final block in blocks) {
+      final p = point(block.state);
+      if (first) {
+        path.moveTo(p.dx, p.dy);
+        first = false;
+      } else {
+        path.lineTo(p.dx, p.dy);
+      }
+      previous = p;
+    }
 
-    Offset cv(Offset p) => Offset(
-      l + (p.dx - d.minX) * scale,
-      s.height - t - (p.dy - d.minY) * scale,
-    );
-
-    c.drawRect(
-      Rect.fromLTWH(l, t, w, h),
+    canvas.drawPath(
+      path,
       Paint()
-        ..color = Colors.white24
+        ..color = accent
+        ..strokeWidth = 2
         ..style = PaintingStyle.stroke,
     );
 
-    for (var i = 0; i < d.moves.length; i++) {
-      final m = d.moves[i];
-
-      final path = Path()
-        ..moveTo(
-          cv(m.points.first).dx,
-          cv(m.points.first).dy,
-        );
-
-      for (final p in m.points.skip(1)) {
-        final q = cv(p);
-        path.lineTo(q.dx, q.dy);
-      }
-
-      final color = i < done
-          ? green
-          : m.rapid
-              ? Colors.blueAccent
-              : Colors.white54;
-
-      c.drawPath(
-        path,
-        Paint()
-          ..color = color
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2,
+    if (currentLine > 0 && currentLine <= blocks.length) {
+      final p = point(blocks[currentLine - 1].state);
+      canvas.drawCircle(
+        p,
+        5,
+        Paint()..color = yellow,
       );
     }
-
-    c.drawCircle(
-      cv(position),
-      6,
-      Paint()..color = orange,
-    );
   }
 
   @override
-  bool shouldRepaint(covariant PathPainter old) {
-    return old.data != data ||
-        old.done != done ||
-        old.position != position;
-  }
+  bool shouldRepaint(covariant ToolpathPainter oldDelegate) =>
+      oldDelegate.blocks != blocks ||
+      oldDelegate.currentLine != currentLine;
 }
