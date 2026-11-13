@@ -50,6 +50,7 @@ class _MainScreenState extends State<MainScreen> {
   bool programRunning = false;
   bool feedHold = false;
   bool emergency = false;
+  bool spindleOn = false;
 
   String selectedAxis = 'X';
   String jogStep = '1.0';
@@ -72,10 +73,23 @@ class _MainScreenState extends State<MainScreen> {
 
   double jogSpeed = 50;
   double feedOverride = 100;
-  double rpm = 0;
   double spindleOverride = 100;
 
+  // قيم F و S المبرمجة من ملف G-code
+  double programmedFeed = 0;
+  double programmedRpm = 0;
+
+  // القيم المحسوبة بعد تطبيق Override
+  double get actualFeed => programmedFeed * feedOverride / 100;
+
+  double get actualRpm =>
+      spindleOn && !emergency
+          ? programmedRpm * spindleOverride / 100
+          : 0;
+
   Timer? programTimer;
+
+  final ScrollController lineScrollController = ScrollController();
 
   final Map<String, Map<String, double>> offsets = {
     for (final code in ['G54', 'G55', 'G56', 'G57', 'G58', 'G59'])
@@ -100,6 +114,7 @@ class _MainScreenState extends State<MainScreen> {
   @override
   void dispose() {
     programTimer?.cancel();
+    lineScrollController.dispose();
     super.dispose();
   }
 
@@ -130,6 +145,7 @@ class _MainScreenState extends State<MainScreen> {
 
   void notify(String message) {
     if (!mounted) return;
+
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message, textAlign: TextAlign.center),
@@ -167,6 +183,7 @@ class _MainScreenState extends State<MainScreen> {
       } else {
         machineZ += distance;
       }
+
       updateWorkCoordinates();
     });
   }
@@ -176,8 +193,11 @@ class _MainScreenState extends State<MainScreen> {
 
     setState(() {
       offsets[workCoordinate]![axis] =
-          axis == 'X' ? machineX :
-          axis == 'Y' ? machineY : machineZ;
+          axis == 'X'
+              ? machineX
+              : axis == 'Y'
+                  ? machineY
+                  : machineZ;
 
       updateWorkCoordinates();
     });
@@ -192,6 +212,7 @@ class _MainScreenState extends State<MainScreen> {
       offsets[workCoordinate]!['X'] = machineX;
       offsets[workCoordinate]!['Y'] = machineY;
       offsets[workCoordinate]!['Z'] = machineZ;
+
       updateWorkCoordinates();
     });
 
@@ -246,13 +267,22 @@ class _MainScreenState extends State<MainScreen> {
             'الحجم: ${(selected.size / 1024).toStringAsFixed(1)} KB';
 
         fileContent = content;
+
         gcodeLines = content
             .split(RegExp(r'\r?\n'))
             .where((line) => line.trim().isNotEmpty)
             .toList();
 
         currentLine = 0;
+
+        programmedFeed = 0;
+        programmedRpm = 0;
+        spindleOn = false;
       });
+
+      if (lineScrollController.hasClients) {
+        lineScrollController.jumpTo(0);
+      }
 
       notify('تم تحميل الملف: ${selected.name}');
     } catch (e) {
@@ -260,29 +290,95 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
+  // قراءة قيمة محور أو أمر F أو S من سطر G-code
+  // مع تجاهل التعليقات والأجزاء التي تأتي بعد ;
   double? readAxisValue(String line, String axis) {
+    final cleanLine = line
+        .replaceAll(RegExp(r'\([^)]*\)'), '')
+        .split(';')
+        .first;
+
     final match = RegExp(
-      '$axis\\s*(-?\\d+(?:\\.\\d+)?)',
+      '(?:^|[^A-Z])$axis\\s*(-?\\d+(?:\\.\\d+)?)',
       caseSensitive: false,
-    ).firstMatch(line);
+    ).firstMatch(cleanLine);
 
     if (match == null) return null;
+
     return double.tryParse(match.group(1)!);
+  }
+
+  // قراءة أوامر M3 و M4 و M5
+  int? readMCode(String line) {
+    final cleanLine = line
+        .replaceAll(RegExp(r'\([^)]*\)'), '')
+        .split(';')
+        .first;
+
+    final match = RegExp(
+      r'(?:^|\s)M\s*(3|4|5)(?=\s|$)',
+      caseSensitive: false,
+    ).firstMatch(cleanLine);
+
+    if (match == null) return null;
+
+    return int.tryParse(match.group(1)!);
   }
 
   void executeSimulationLine(String line) {
     final x = readAxisValue(line, 'X');
     final y = readAxisValue(line, 'Y');
     final z = readAxisValue(line, 'Z');
+    final f = readAxisValue(line, 'F');
     final s = readAxisValue(line, 'S');
+    final m = readMCode(line);
 
     setState(() {
       if (x != null) machineX = x;
       if (y != null) machineY = y;
       if (z != null) machineZ = z;
-      if (s != null) rpm = s;
+
+      // F و S أوامر مستمرة حتى ورود قيمة جديدة
+      if (f != null) programmedFeed = f;
+      if (s != null) programmedRpm = s;
+
+      // M3 و M4 تشغيل، و M5 إيقاف
+      if (m == 3 || m == 4) {
+        spindleOn = true;
+      } else if (m == 5) {
+        spindleOn = false;
+      }
 
       updateWorkCoordinates();
+    });
+  }
+
+  // إبقاء السطر الجاري داخل نافذة العرض
+  void keepCurrentLineVisible() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !lineScrollController.hasClients) return;
+
+      const lineHeight = 22.0;
+      const visibleLinesAbove = 4;
+
+      final activeIndex = currentLine - 1;
+
+      if (activeIndex < 0) return;
+
+      final targetOffset =
+          (activeIndex - visibleLinesAbove) * lineHeight;
+
+      final position = lineScrollController.position;
+
+      final safeOffset = targetOffset
+          .clamp(0.0, position.maxScrollExtent)
+          .toDouble();
+
+      lineScrollController.animateTo(
+        safeOffset,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+      );
     });
   }
 
@@ -301,6 +397,7 @@ class _MainScreenState extends State<MainScreen> {
       setState(() {
         feedHold = false;
       });
+
       notify('استئناف المحاكاة');
       return;
     }
@@ -310,7 +407,6 @@ class _MainScreenState extends State<MainScreen> {
     setState(() {
       programRunning = true;
       feedHold = false;
-      emergency = false;
     });
 
     programTimer = Timer.periodic(
@@ -344,6 +440,7 @@ class _MainScreenState extends State<MainScreen> {
         });
 
         executeSimulationLine(line);
+        keepCurrentLineVisible();
       },
     );
 
@@ -370,7 +467,12 @@ class _MainScreenState extends State<MainScreen> {
       programRunning = false;
       feedHold = false;
       currentLine = 0;
+      spindleOn = false;
     });
+
+    if (lineScrollController.hasClients) {
+      lineScrollController.jumpTo(0);
+    }
 
     notify('تم إيقاف المحاكاة');
   }
@@ -382,7 +484,7 @@ class _MainScreenState extends State<MainScreen> {
       emergency = true;
       programRunning = false;
       feedHold = false;
-      rpm = 0;
+      spindleOn = false;
     });
 
     notify('تم إيقاف المحاكاة - ليس إيقافاً حقيقياً للماكينة');
@@ -611,7 +713,7 @@ class _MainScreenState extends State<MainScreen> {
   Widget buildProgramScreen() {
     final progress = gcodeLines.isEmpty
         ? 0.0
-        : currentLine / gcodeLines.length;
+        : (currentLine / gcodeLines.length).clamp(0.0, 1.0);
 
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -720,20 +822,28 @@ class _MainScreenState extends State<MainScreen> {
             child: gcodeLines.isEmpty
                 ? const Center(child: Text('لا يوجد ملف محمّل'))
                 : ListView.builder(
+                    controller: lineScrollController,
                     itemCount: gcodeLines.length,
+                    itemExtent: 22,
                     itemBuilder: (context, index) {
                       final active = index == currentLine - 1;
 
                       return Container(
+                        alignment: Alignment.centerLeft,
                         color: active
-                            ? green.withOpacity(0.2)
+                            ? green.withOpacity(0.25)
                             : Colors.transparent,
-                        padding: const EdgeInsets.symmetric(vertical: 3),
+                        padding: const EdgeInsets.symmetric(horizontal: 5),
                         child: Text(
                           '${index + 1}: ${gcodeLines[index]}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontFamily: 'monospace',
                             fontSize: 12,
+                            fontWeight: active
+                                ? FontWeight.bold
+                                : FontWeight.normal,
                             color: active ? green : Colors.white70,
                           ),
                         ),
@@ -743,12 +853,41 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ),
 
+        // عداد التغذية
         panelBox(
-          title: 'FEED RATE OVERRIDE',
+          title: 'FEED RATE',
           child: Column(
             children: [
-              Text('${feedOverride.toInt()}%',
-                  style: const TextStyle(fontSize: 24, color: green)),
+              const Text(
+                'PROGRAMMED FEED (F)',
+                style: TextStyle(color: Colors.white54),
+              ),
+              Text(
+                '${programmedFeed.toStringAsFixed(1)} mm/min',
+                style: const TextStyle(
+                  fontSize: 23,
+                  color: orange,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'ACTUAL FEED (SIMULATED)',
+                style: TextStyle(color: Colors.white54),
+              ),
+              Text(
+                '${actualFeed.toStringAsFixed(1)} mm/min',
+                style: const TextStyle(
+                  fontSize: 27,
+                  color: green,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Divider(color: Colors.white24),
+              Text(
+                'FEED OVERRIDE: ${feedOverride.toInt()}%',
+                style: const TextStyle(fontSize: 18, color: green),
+              ),
               Slider(
                 value: feedOverride,
                 min: 10,
@@ -759,26 +898,52 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ),
 
+        // عداد سرعة الإسبندل
         panelBox(
-          title: 'SPINDLE RPM',
+          title: 'SPINDLE SPEED',
           child: Column(
             children: [
+              const Text(
+                'PROGRAMMED RPM (S)',
+                style: TextStyle(color: Colors.white54),
+              ),
               Text(
-                'RPM: ${rpm.toInt()}',
-                style: const TextStyle(fontSize: 24, color: green),
+                '${programmedRpm.toInt()} RPM',
+                style: const TextStyle(
+                  fontSize: 23,
+                  color: orange,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
-              Slider(
-                value: rpm.clamp(0, 10000).toDouble(),
-                min: 0,
-                max: 10000,
-                onChanged: (v) => setState(() => rpm = v),
+              const SizedBox(height: 12),
+              const Text(
+                'ACTUAL RPM (SIMULATED)',
+                style: TextStyle(color: Colors.white54),
               ),
+              Text(
+                '${actualRpm.toInt()} RPM',
+                style: const TextStyle(
+                  fontSize: 27,
+                  color: green,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Divider(color: Colors.white24),
               Row(
                 children: [
                   Expanded(
                     child: actionButton(
                       'SPINDLE ON',
-                      () => setState(() => rpm = 3000),
+                      () {
+                        if (emergency) return;
+
+                        setState(() {
+                          if (programmedRpm == 0) {
+                            programmedRpm = 3000;
+                          }
+                          spindleOn = true;
+                        });
+                      },
                       color: const Color(0xFF167A42),
                     ),
                   ),
@@ -786,7 +951,11 @@ class _MainScreenState extends State<MainScreen> {
                   Expanded(
                     child: actionButton(
                       'SPINDLE OFF',
-                      () => setState(() => rpm = 0),
+                      () {
+                        setState(() {
+                          spindleOn = false;
+                        });
+                      },
                       color: Colors.red.shade900,
                     ),
                   ),
@@ -800,8 +969,10 @@ class _MainScreenState extends State<MainScreen> {
           title: 'SPINDLE OVERRIDE',
           child: Column(
             children: [
-              Text('${spindleOverride.toInt()}%',
-                  style: const TextStyle(fontSize: 24, color: green)),
+              Text(
+                '${spindleOverride.toInt()}%',
+                style: const TextStyle(fontSize: 24, color: green),
+              ),
               Slider(
                 value: spindleOverride,
                 min: 50,
@@ -894,8 +1065,10 @@ class _MainScreenState extends State<MainScreen> {
           title: 'JOG SPEED',
           child: Column(
             children: [
-              Text('${jogSpeed.toInt()}%',
-                  style: const TextStyle(fontSize: 22, color: green)),
+              Text(
+                '${jogSpeed.toInt()}%',
+                style: const TextStyle(fontSize: 22, color: green),
+              ),
               Slider(
                 value: jogSpeed,
                 min: 1,
@@ -976,7 +1149,11 @@ class _MainScreenState extends State<MainScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(Icons.insert_drive_file, size: 45, color: orange),
+              const Icon(
+                Icons.insert_drive_file,
+                size: 45,
+                color: orange,
+              ),
               const SizedBox(height: 10),
               Text(fileName),
               Text(fileInfo, style: const TextStyle(color: Colors.white54)),
@@ -1049,10 +1226,16 @@ class _MainScreenState extends State<MainScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text('عنوان الكمبيوتر'),
-              Text(ip, style: const TextStyle(color: green, fontSize: 19)),
+              Text(
+                ip,
+                style: const TextStyle(color: green, fontSize: 19),
+              ),
               const SizedBox(height: 12),
               const Text('Port'),
-              Text(port, style: const TextStyle(color: green, fontSize: 19)),
+              Text(
+                port,
+                style: const TextStyle(color: green, fontSize: 19),
+              ),
               const SizedBox(height: 15),
               actionButton(
                 'تعديل إعدادات الاتصال',
@@ -1082,7 +1265,9 @@ class _MainScreenState extends State<MainScreen> {
               ),
               const SizedBox(height: 15),
               actionButton(
-                connected ? 'فصل الاتصال التجريبي' : 'تفعيل الاتصال التجريبي',
+                connected
+                    ? 'فصل الاتصال التجريبي'
+                    : 'تفعيل الاتصال التجريبي',
                 toggleConnection,
                 icon: Icons.wifi,
               ),
@@ -1207,11 +1392,19 @@ class ToolpathPainter extends CustomPainter {
       ..strokeWidth = 0.6;
 
     for (double i = 0; i < size.width; i += 20) {
-      canvas.drawLine(Offset(i, 0), Offset(i, size.height), gridPaint);
+      canvas.drawLine(
+        Offset(i, 0),
+        Offset(i, size.height),
+        gridPaint,
+      );
     }
 
     for (double i = 0; i < size.height; i += 20) {
-      canvas.drawLine(Offset(0, i), Offset(size.width, i), gridPaint);
+      canvas.drawLine(
+        Offset(0, i),
+        Offset(size.width, i),
+        gridPaint,
+      );
     }
 
     final pathPaint = Paint()
@@ -1229,11 +1422,15 @@ class ToolpathPainter extends CustomPainter {
     canvas.drawPath(path, pathPaint);
 
     final px = (size.width * 0.5 + x * 2)
-        .clamp(0.0, size.width).toDouble();
+        .clamp(0.0, size.width)
+        .toDouble();
+
     final py = (size.height * 0.5 - y * 2)
-        .clamp(0.0, size.height).toDouble();
+        .clamp(0.0, size.height)
+        .toDouble();
 
     final toolPaint = Paint()..color = orange;
+
     canvas.drawCircle(Offset(px, py), 6, toolPaint);
   }
 
