@@ -1,11 +1,12 @@
 
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:file_picker/file_picker.dart';
 
-void main() {
-  runApp(const Mach3Remote());
-}
+void main() => runApp(const Mach3Remote());
 
 const bg = Color(0xFF171C22);
 const panel = Color(0xFF252D36);
@@ -24,10 +25,7 @@ class Mach3Remote extends StatelessWidget {
       theme: ThemeData(
         brightness: Brightness.dark,
         scaffoldBackgroundColor: bg,
-        colorScheme: const ColorScheme.dark(
-          primary: green,
-          surface: panel,
-        ),
+        colorScheme: const ColorScheme.dark(primary: green),
         useMaterial3: true,
       ),
       home: const MainScreen(),
@@ -49,6 +47,9 @@ class _MainScreenState extends State<MainScreen> {
   String port = '8765';
 
   bool connected = false;
+  bool programRunning = false;
+  bool feedHold = false;
+  bool emergency = false;
 
   String selectedAxis = 'X';
   String jogStep = '1.0';
@@ -57,6 +58,9 @@ class _MainScreenState extends State<MainScreen> {
   String fileName = 'لم يتم اختيار ملف';
   String fileInfo = '';
   String fileContent = '';
+
+  List<String> gcodeLines = [];
+  int currentLine = 0;
 
   double machineX = 0;
   double machineY = 0;
@@ -71,6 +75,13 @@ class _MainScreenState extends State<MainScreen> {
   double rpm = 0;
   double spindleOverride = 100;
 
+  Timer? programTimer;
+
+  final Map<String, Map<String, double>> offsets = {
+    for (final code in ['G54', 'G55', 'G56', 'G57', 'G58', 'G59'])
+      code: {'X': 0, 'Y': 0, 'Z': 0},
+  };
+
   final List<String> pageTitles = [
     'PROGRAM RUN',
     'MANUAL JOG',
@@ -83,11 +94,17 @@ class _MainScreenState extends State<MainScreen> {
   void initState() {
     super.initState();
     loadSettings();
+    updateWorkCoordinates();
+  }
+
+  @override
+  void dispose() {
+    programTimer?.cancel();
+    super.dispose();
   }
 
   Future<void> loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
-
     if (!mounted) return;
 
     setState(() {
@@ -96,12 +113,8 @@ class _MainScreenState extends State<MainScreen> {
     });
   }
 
-  Future<void> saveSettings(
-    String newIp,
-    String newPort,
-  ) async {
+  Future<void> saveSettings(String newIp, String newPort) async {
     final prefs = await SharedPreferences.getInstance();
-
     await prefs.setString('ip', newIp);
     await prefs.setString('port', newPort);
 
@@ -111,22 +124,288 @@ class _MainScreenState extends State<MainScreen> {
       ip = newIp;
       port = newPort;
     });
+
+    notify('تم حفظ إعدادات الاتصال');
   }
 
   void notify(String message) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(
-          message,
-          textAlign: TextAlign.center,
-        ),
+        content: Text(message, textAlign: TextAlign.center),
         duration: const Duration(seconds: 2),
       ),
     );
   }
 
-  void unavailable(String command) {
-    notify('$command: سيتم تفعيله بعد تجهيز برنامج Windows');
+  void updateWorkCoordinates() {
+    final offset = offsets[workCoordinate]!;
+
+    workX = machineX - offset['X']!;
+    workY = machineY - offset['Y']!;
+    workZ = machineZ - offset['Z']!;
+  }
+
+  void moveAxis(String axis, double direction) {
+    if (emergency) {
+      notify('ألغِ حالة الطوارئ أولاً');
+      return;
+    }
+
+    if (programRunning && !feedHold) {
+      notify('أوقف البرنامج قبل الحركة اليدوية');
+      return;
+    }
+
+    final distance = double.parse(jogStep) * direction;
+
+    setState(() {
+      if (axis == 'X') {
+        machineX += distance;
+      } else if (axis == 'Y') {
+        machineY += distance;
+      } else {
+        machineZ += distance;
+      }
+      updateWorkCoordinates();
+    });
+  }
+
+  void zeroAxis(String axis) {
+    if (emergency) return;
+
+    setState(() {
+      offsets[workCoordinate]![axis] =
+          axis == 'X' ? machineX :
+          axis == 'Y' ? machineY : machineZ;
+
+      updateWorkCoordinates();
+    });
+
+    notify('تم تصفير $axis في $workCoordinate');
+  }
+
+  void zeroAll() {
+    if (emergency) return;
+
+    setState(() {
+      offsets[workCoordinate]!['X'] = machineX;
+      offsets[workCoordinate]!['Y'] = machineY;
+      offsets[workCoordinate]!['Z'] = machineZ;
+      updateWorkCoordinates();
+    });
+
+    notify('تم تصفير جميع المحاور في $workCoordinate');
+  }
+
+  void toolZero() {
+    if (emergency) return;
+
+    setState(() {
+      offsets[workCoordinate]!['Z'] = machineZ;
+      updateWorkCoordinates();
+    });
+
+    notify('تم ضبط صفر الأداة تجريبياً');
+  }
+
+  void changeWorkCoordinate(String? value) {
+    if (value == null) return;
+
+    setState(() {
+      workCoordinate = value;
+      updateWorkCoordinates();
+    });
+
+    notify('تم اختيار $value');
+  }
+
+  Future<void> chooseFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['nc', 'tap', 'gcode', 'txt', 'cnc'],
+        withData: true,
+      );
+
+      if (result == null || result.files.isEmpty) return;
+
+      final selected = result.files.first;
+      final bytes = selected.bytes;
+
+      if (bytes == null) {
+        notify('تعذرت قراءة الملف');
+        return;
+      }
+
+      final content = String.fromCharCodes(bytes);
+
+      setState(() {
+        fileName = selected.name;
+        fileInfo =
+            'الحجم: ${(selected.size / 1024).toStringAsFixed(1)} KB';
+
+        fileContent = content;
+        gcodeLines = content
+            .split(RegExp(r'\r?\n'))
+            .where((line) => line.trim().isNotEmpty)
+            .toList();
+
+        currentLine = 0;
+      });
+
+      notify('تم تحميل الملف: ${selected.name}');
+    } catch (e) {
+      notify('حدث خطأ أثناء فتح الملف');
+    }
+  }
+
+  double? readAxisValue(String line, String axis) {
+    final match = RegExp(
+      '$axis\\s*(-?\\d+(?:\\.\\d+)?)',
+      caseSensitive: false,
+    ).firstMatch(line);
+
+    if (match == null) return null;
+    return double.tryParse(match.group(1)!);
+  }
+
+  void executeSimulationLine(String line) {
+    final x = readAxisValue(line, 'X');
+    final y = readAxisValue(line, 'Y');
+    final z = readAxisValue(line, 'Z');
+    final s = readAxisValue(line, 'S');
+
+    setState(() {
+      if (x != null) machineX = x;
+      if (y != null) machineY = y;
+      if (z != null) machineZ = z;
+      if (s != null) rpm = s;
+
+      updateWorkCoordinates();
+    });
+  }
+
+  void startProgram() {
+    if (emergency) {
+      notify('ألغِ حالة الطوارئ أولاً');
+      return;
+    }
+
+    if (gcodeLines.isEmpty) {
+      notify('اختر ملف G-code أولاً');
+      return;
+    }
+
+    if (programRunning && feedHold) {
+      setState(() {
+        feedHold = false;
+      });
+      notify('استئناف المحاكاة');
+      return;
+    }
+
+    programTimer?.cancel();
+
+    setState(() {
+      programRunning = true;
+      feedHold = false;
+      emergency = false;
+    });
+
+    programTimer = Timer.periodic(
+      Duration(
+        milliseconds: math.max(
+          100,
+          (1000 / (jogSpeed / 50 + 1)).round(),
+        ),
+      ),
+      (timer) {
+        if (!mounted || !programRunning || feedHold || emergency) {
+          return;
+        }
+
+        if (currentLine >= gcodeLines.length) {
+          timer.cancel();
+
+          setState(() {
+            programRunning = false;
+            currentLine = gcodeLines.length;
+          });
+
+          notify('اكتملت محاكاة البرنامج');
+          return;
+        }
+
+        final line = gcodeLines[currentLine];
+
+        setState(() {
+          currentLine++;
+        });
+
+        executeSimulationLine(line);
+      },
+    );
+
+    notify('بدأت محاكاة البرنامج');
+  }
+
+  void pauseProgram() {
+    if (!programRunning) {
+      notify('لا يوجد برنامج يعمل');
+      return;
+    }
+
+    setState(() {
+      feedHold = true;
+    });
+
+    notify('تم إيقاف المحاكاة مؤقتاً');
+  }
+
+  void stopProgram() {
+    programTimer?.cancel();
+
+    setState(() {
+      programRunning = false;
+      feedHold = false;
+      currentLine = 0;
+    });
+
+    notify('تم إيقاف المحاكاة');
+  }
+
+  void emergencyStop() {
+    programTimer?.cancel();
+
+    setState(() {
+      emergency = true;
+      programRunning = false;
+      feedHold = false;
+      rpm = 0;
+    });
+
+    notify('تم إيقاف المحاكاة - ليس إيقافاً حقيقياً للماكينة');
+  }
+
+  void resetEmergency() {
+    setState(() {
+      emergency = false;
+    });
+
+    notify('تم إلغاء حالة الطوارئ التجريبية');
+  }
+
+  void toggleConnection() {
+    setState(() {
+      connected = !connected;
+    });
+
+    notify(
+      connected
+          ? 'تم تفعيل حالة الاتصال التجريبية'
+          : 'تم فصل حالة الاتصال التجريبية',
+    );
   }
 
   Future<void> showSettings() async {
@@ -145,17 +424,13 @@ class _MainScreenState extends State<MainScreen> {
               controller: ipController,
               decoration: const InputDecoration(
                 labelText: 'عنوان IP الكمبيوتر',
-                hintText: '192.168.1.100',
               ),
             ),
             const SizedBox(height: 12),
             TextField(
               controller: portController,
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Port',
-                hintText: '8765',
-              ),
+              decoration: const InputDecoration(labelText: 'Port'),
             ),
           ],
         ),
@@ -183,8 +458,6 @@ class _MainScreenState extends State<MainScreen> {
               if (dialogContext.mounted) {
                 Navigator.pop(dialogContext);
               }
-
-              notify('تم حفظ الإعدادات');
             },
             child: const Text('حفظ'),
           ),
@@ -194,92 +467,6 @@ class _MainScreenState extends State<MainScreen> {
 
     ipController.dispose();
     portController.dispose();
-  }
-
-  Future<void> chooseFile() async {
-    try {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: [
-          'nc',
-          'tap',
-          'gcode',
-          'txt',
-          'cnc',
-        ],
-        withData: true,
-      );
-
-      if (result == null || result.files.isEmpty) return;
-
-      final selected = result.files.first;
-
-      setState(() {
-        fileName = selected.name;
-        fileInfo =
-            'الحجم: ${(selected.size / 1024).toStringAsFixed(1)} KB';
-
-        if (selected.bytes != null) {
-          fileContent = String.fromCharCodes(selected.bytes!);
-        } else {
-          fileContent = 'تعذرت قراءة محتويات الملف';
-        }
-      });
-
-      notify('تم اختيار الملف');
-    } catch (e) {
-      notify('تعذر فتح الملف');
-    }
-  }
-
-  void jog(String axis, double direction) {
-    if (!connected) {
-      notify('اتصل بالكمبيوتر أولاً');
-      return;
-    }
-
-    unavailable('تحريك المحور $axis');
-  }
-
-  void zeroAxis(String axis) {
-    if (!connected) {
-      notify('اتصل بالكمبيوتر أولاً');
-      return;
-    }
-
-    unavailable('تصفير المحور $axis');
-  }
-
-  void zeroAll() {
-    if (!connected) {
-      notify('اتصل بالكمبيوتر أولاً');
-      return;
-    }
-
-    unavailable('تصفير جميع المحاور');
-  }
-
-  void emergencyStop() {
-    showDialog(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        backgroundColor: panel,
-        title: const Text(
-          'إيقاف طارئ عن بُعد',
-          style: TextStyle(color: red),
-        ),
-        content: const Text(
-          'زر الطوارئ غير مربوط حتى الآن ببرنامج Mach3. '
-          'ولا يغني عن دائرة الطوارئ المادية المستقلة.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('إغلاق'),
-          ),
-        ],
-      ),
-    );
   }
 
   Widget panelBox({
@@ -317,14 +504,14 @@ class _MainScreenState extends State<MainScreen> {
     String text,
     VoidCallback action, {
     Color color = const Color(0xFF344452),
-    IconData? icon,
+    IconData icon = Icons.circle,
   }) {
     return SizedBox(
       height: 48,
       width: double.infinity,
       child: ElevatedButton.icon(
         onPressed: action,
-        icon: Icon(icon ?? Icons.circle, size: 16),
+        icon: Icon(icon, size: 17),
         label: Text(
           text,
           textAlign: TextAlign.center,
@@ -345,10 +532,7 @@ class _MainScreenState extends State<MainScreen> {
     return Expanded(
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 3),
-        padding: const EdgeInsets.symmetric(
-          vertical: 13,
-          horizontal: 3,
-        ),
+        padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 3),
         decoration: BoxDecoration(
           color: const Color(0xFF11161C),
           borderRadius: BorderRadius.circular(9),
@@ -406,26 +590,11 @@ class _MainScreenState extends State<MainScreen> {
         children: [
           Row(
             children: [
-              Expanded(
-                child: actionButton(
-                  'ZERO X',
-                  () => zeroAxis('X'),
-                ),
-              ),
+              Expanded(child: actionButton('ZERO X', () => zeroAxis('X'))),
               const SizedBox(width: 6),
-              Expanded(
-                child: actionButton(
-                  'ZERO Y',
-                  () => zeroAxis('Y'),
-                ),
-              ),
+              Expanded(child: actionButton('ZERO Y', () => zeroAxis('Y'))),
               const SizedBox(width: 6),
-              Expanded(
-                child: actionButton(
-                  'ZERO Z',
-                  () => zeroAxis('Z'),
-                ),
-              ),
+              Expanded(child: actionButton('ZERO Z', () => zeroAxis('Z'))),
             ],
           ),
           const SizedBox(height: 10),
@@ -439,9 +608,11 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  // الشاشة الأولى: تشغيل البرنامج
-
   Widget buildProgramScreen() {
+    final progress = gcodeLines.isEmpty
+        ? 0.0
+        : currentLine / gcodeLines.length;
+
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
@@ -452,10 +623,7 @@ class _MainScreenState extends State<MainScreen> {
             children: [
               Text(fileName),
               const SizedBox(height: 5),
-              Text(
-                fileInfo,
-                style: const TextStyle(color: Colors.white54),
-              ),
+              Text(fileInfo, style: const TextStyle(color: Colors.white54)),
               const SizedBox(height: 12),
               actionButton(
                 'فتح ملف G-code',
@@ -468,22 +636,19 @@ class _MainScreenState extends State<MainScreen> {
 
         panelBox(
           title: 'TOOLPATH DISPLAY',
-          child: Container(
+          child: SizedBox(
             height: 190,
-            width: double.infinity,
-            decoration: BoxDecoration(
-              color: const Color(0xFF101820),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: const CustomPaint(
-              painter: ToolpathPainter(),
+            child: CustomPaint(
+              painter: ToolpathPainter(
+                x: workX,
+                y: workY,
+              ),
               child: Center(
                 child: Text(
-                  'معاينة تجريبية - ليست مسار الملف',
-                  style: TextStyle(
-                    color: Colors.white54,
-                    fontSize: 11,
-                  ),
+                  gcodeLines.isEmpty
+                      ? 'اختر ملفاً لبدء المحاكاة'
+                      : 'موضع الأداة في المحاكاة',
+                  style: const TextStyle(color: Colors.white54),
                 ),
               ),
             ),
@@ -498,37 +663,6 @@ class _MainScreenState extends State<MainScreen> {
         ),
 
         panelBox(
-          title: 'G-CODE LINES',
-          child: Container(
-            height: 180,
-            width: double.infinity,
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF10161D),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: fileContent.isEmpty
-                ? const Center(
-                    child: Text(
-                      'سيظهر كود G-code هنا بعد اختيار الملف',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.white54),
-                    ),
-                  )
-                : SingleChildScrollView(
-                    child: SelectableText(
-                      fileContent,
-                      style: const TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 12,
-                        color: green,
-                      ),
-                    ),
-                  ),
-          ),
-        ),
-
-        panelBox(
           title: 'PROGRAM RUN',
           child: Column(
             children: [
@@ -536,8 +670,10 @@ class _MainScreenState extends State<MainScreen> {
                 children: [
                   Expanded(
                     child: actionButton(
-                      'CYCLE START',
-                      () => unavailable('Cycle Start'),
+                      programRunning && feedHold
+                          ? 'RESUME'
+                          : 'CYCLE START',
+                      startProgram,
                       color: const Color(0xFF167A42),
                       icon: Icons.play_arrow,
                     ),
@@ -546,7 +682,7 @@ class _MainScreenState extends State<MainScreen> {
                   Expanded(
                     child: actionButton(
                       'FEED HOLD',
-                      () => unavailable('Feed Hold'),
+                      pauseProgram,
                       color: const Color(0xFFAA7621),
                       icon: Icons.pause,
                     ),
@@ -556,18 +692,54 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 9),
               actionButton(
                 'STOP',
-                () => unavailable('Stop'),
+                stopProgram,
                 color: Colors.red.shade900,
                 icon: Icons.stop,
               ),
               const SizedBox(height: 12),
-              const LinearProgressIndicator(value: 0),
+              LinearProgressIndicator(value: progress),
               const SizedBox(height: 8),
-              const Text(
-                'السطر الحالي: --     التقدم: 0%',
-                style: TextStyle(color: Colors.white54),
+              Text(
+                'السطر: $currentLine / ${gcodeLines.length}',
+                style: const TextStyle(color: Colors.white70),
               ),
+              Text('${(progress * 100).toStringAsFixed(1)}%'),
             ],
+          ),
+        ),
+
+        panelBox(
+          title: 'G-CODE LINES',
+          child: Container(
+            height: 220,
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF10161D),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: gcodeLines.isEmpty
+                ? const Center(child: Text('لا يوجد ملف محمّل'))
+                : ListView.builder(
+                    itemCount: gcodeLines.length,
+                    itemBuilder: (context, index) {
+                      final active = index == currentLine - 1;
+
+                      return Container(
+                        color: active
+                            ? green.withOpacity(0.2)
+                            : Colors.transparent,
+                        padding: const EdgeInsets.symmetric(vertical: 3),
+                        child: Text(
+                          '${index + 1}: ${gcodeLines[index]}',
+                          style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 12,
+                            color: active ? green : Colors.white70,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
           ),
         ),
 
@@ -575,54 +747,38 @@ class _MainScreenState extends State<MainScreen> {
           title: 'FEED RATE OVERRIDE',
           child: Column(
             children: [
-              Text(
-                '${feedOverride.toInt()}%',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
-              ),
+              Text('${feedOverride.toInt()}%',
+                  style: const TextStyle(fontSize: 24, color: green)),
               Slider(
-                value: feedOverride.clamp(10, 150).toDouble(),
+                value: feedOverride,
                 min: 10,
                 max: 150,
-                onChanged: (v) {
-                  setState(() {
-                    feedOverride = v;
-                  });
-                },
+                onChanged: (v) => setState(() => feedOverride = v),
               ),
             ],
           ),
         ),
 
         panelBox(
-          title: 'SPINDLE',
+          title: 'SPINDLE RPM',
           child: Column(
             children: [
               Text(
                 'RPM: ${rpm.toInt()}',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
+                style: const TextStyle(fontSize: 24, color: green),
               ),
               Slider(
                 value: rpm.clamp(0, 10000).toDouble(),
                 min: 0,
                 max: 10000,
-                onChanged: (v) {
-                  setState(() {
-                    rpm = v;
-                  });
-                },
+                onChanged: (v) => setState(() => rpm = v),
               ),
               Row(
                 children: [
                   Expanded(
                     child: actionButton(
                       'SPINDLE ON',
-                      () => unavailable('Spindle On'),
+                      () => setState(() => rpm = 3000),
                       color: const Color(0xFF167A42),
                     ),
                   ),
@@ -630,7 +786,7 @@ class _MainScreenState extends State<MainScreen> {
                   Expanded(
                     child: actionButton(
                       'SPINDLE OFF',
-                      () => unavailable('Spindle Off'),
+                      () => setState(() => rpm = 0),
                       color: Colors.red.shade900,
                     ),
                   ),
@@ -644,44 +800,13 @@ class _MainScreenState extends State<MainScreen> {
           title: 'SPINDLE OVERRIDE',
           child: Column(
             children: [
-              Text(
-                '${spindleOverride.toInt()}%',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
-              ),
+              Text('${spindleOverride.toInt()}%',
+                  style: const TextStyle(fontSize: 24, color: green)),
               Slider(
-                value: spindleOverride.clamp(50, 150).toDouble(),
+                value: spindleOverride,
                 min: 50,
                 max: 150,
-                onChanged: (v) {
-                  setState(() {
-                    spindleOverride = v;
-                  });
-                },
-              ),
-            ],
-          ),
-        ),
-
-        panelBox(
-          title: 'COOLANT',
-          child: Row(
-            children: [
-              Expanded(
-                child: actionButton(
-                  'COOLANT ON',
-                  () => unavailable('Coolant On'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: actionButton(
-                  'COOLANT OFF',
-                  () => unavailable('Coolant Off'),
-                  color: Colors.red.shade900,
-                ),
+                onChanged: (v) => setState(() => spindleOverride = v),
               ),
             ],
           ),
@@ -689,8 +814,6 @@ class _MainScreenState extends State<MainScreen> {
       ],
     );
   }
-
-  // الشاشة الثانية: التحكم اليدوي
 
   Widget buildJogScreen() {
     return ListView(
@@ -702,9 +825,8 @@ class _MainScreenState extends State<MainScreen> {
           y: machineY,
           z: machineZ,
         ),
-
         coordinatesPanel(
-          title: 'WORK COORDINATES',
+          title: 'WORK COORDINATES - $workCoordinate',
           x: workX,
           y: workY,
           z: workZ,
@@ -716,16 +838,9 @@ class _MainScreenState extends State<MainScreen> {
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: ['X', 'Y', 'Z'].map((axis) {
               return ChoiceChip(
-                label: Text(
-                  axis,
-                  style: const TextStyle(fontSize: 18),
-                ),
+                label: Text(axis, style: const TextStyle(fontSize: 18)),
                 selected: selectedAxis == axis,
-                onSelected: (_) {
-                  setState(() {
-                    selectedAxis = axis;
-                  });
-                },
+                onSelected: (_) => setState(() => selectedAxis = axis),
               );
             }).toList(),
           ),
@@ -739,60 +854,37 @@ class _MainScreenState extends State<MainScreen> {
               labelText: 'مسافة الحركة',
               border: OutlineInputBorder(),
             ),
-            items: [
-              '0.01',
-              '0.1',
-              '1.0',
-              '10.0',
-            ].map((v) {
+            items: ['0.01', '0.1', '1.0', '10.0'].map((v) {
               return DropdownMenuItem(
                 value: v,
                 child: Text('$v mm'),
               );
             }).toList(),
             onChanged: (v) {
-              if (v != null) {
-                setState(() {
-                  jogStep = v;
-                });
-              }
+              if (v != null) setState(() => jogStep = v);
             },
           ),
         ),
 
         panelBox(
-          title: 'JOG CONTROL',
-          child: Column(
+          title: 'JOG CONTROL - $selectedAxis',
+          child: Row(
             children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  SizedBox(
-                    width: 105,
-                    height: 65,
-                    child: actionButton(
-                      '−',
-                      () => jog(selectedAxis, -1),
-                      icon: Icons.remove,
-                    ),
-                  ),
-                  const SizedBox(width: 20),
-                  SizedBox(
-                    width: 105,
-                    height: 65,
-                    child: actionButton(
-                      '+',
-                      () => jog(selectedAxis, 1),
-                      icon: Icons.add,
-                    ),
-                  ),
-                ],
+              Expanded(
+                child: actionButton(
+                  'NEGATIVE  −',
+                  () => moveAxis(selectedAxis, -1),
+                  icon: Icons.remove,
+                ),
               ),
-              const SizedBox(height: 12),
-              actionButton(
-                'HOME ALL',
-                () => unavailable('Home All'),
-                icon: Icons.home,
+              const SizedBox(width: 10),
+              Expanded(
+                child: actionButton(
+                  'POSITIVE  +',
+                  () => moveAxis(selectedAxis, 1),
+                  color: const Color(0xFF167A42),
+                  icon: Icons.add,
+                ),
               ),
             ],
           ),
@@ -802,18 +894,14 @@ class _MainScreenState extends State<MainScreen> {
           title: 'JOG SPEED',
           child: Column(
             children: [
-              const Text('سرعة الحركة'),
+              Text('${jogSpeed.toInt()}%',
+                  style: const TextStyle(fontSize: 22, color: green)),
               Slider(
-                value: jogSpeed.clamp(1, 100).toDouble(),
+                value: jogSpeed,
                 min: 1,
                 max: 100,
-                onChanged: (v) {
-                  setState(() {
-                    jogSpeed = v;
-                  });
-                },
+                onChanged: (v) => setState(() => jogSpeed = v),
               ),
-              Text('${jogSpeed.toInt()}%'),
             ],
           ),
         ),
@@ -822,8 +910,6 @@ class _MainScreenState extends State<MainScreen> {
       ],
     );
   }
-
-  // الشاشة الثالثة: الأوفست
 
   Widget buildOffsetsScreen() {
     return ListView(
@@ -835,7 +921,6 @@ class _MainScreenState extends State<MainScreen> {
           y: machineY,
           z: machineZ,
         ),
-
         coordinatesPanel(
           title: 'WORK COORDINATES',
           x: workX,
@@ -845,37 +930,25 @@ class _MainScreenState extends State<MainScreen> {
 
         panelBox(
           title: 'WORK OFFSET',
-          child: Column(
+          child: DropdownButtonFormField<String>(
+            value: workCoordinate,
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+            ),
+            items: ['G54', 'G55', 'G56', 'G57', 'G58', 'G59']
+                .map((v) => DropdownMenuItem(value: v, child: Text(v)))
+                .toList(),
+            onChanged: changeWorkCoordinate,
+          ),
+        ),
+
+        panelBox(
+          title: 'CURRENT OFFSET VALUES',
+          child: Row(
             children: [
-              const Text('Coordinate System'),
-              const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                value: workCoordinate,
-                decoration: const InputDecoration(
-                  border: OutlineInputBorder(),
-                ),
-                items: [
-                  'G54',
-                  'G55',
-                  'G56',
-                  'G57',
-                  'G58',
-                  'G59',
-                ].map((v) {
-                  return DropdownMenuItem(
-                    value: v,
-                    child: Text(v),
-                  );
-                }).toList(),
-                onChanged: (v) {
-                  if (v != null) {
-                    setState(() {
-                      workCoordinate = v;
-                    });
-                    unavailable('تغيير نظام الإحداثيات');
-                  }
-                },
-              ),
+              valueBox('X', offsets[workCoordinate]!['X']!),
+              valueBox('Y', offsets[workCoordinate]!['Y']!),
+              valueBox('Z', offsets[workCoordinate]!['Z']!),
             ],
           ),
         ),
@@ -884,26 +957,15 @@ class _MainScreenState extends State<MainScreen> {
 
         panelBox(
           title: 'TOOL OFFSET',
-          child: Column(
-            children: [
-              const Text(
-                'إعداد صفر الأداة',
-                style: TextStyle(color: Colors.white70),
-              ),
-              const SizedBox(height: 12),
-              actionButton(
-                'TOOL ZERO',
-                () => unavailable('Tool Zero'),
-                icon: Icons.build,
-              ),
-            ],
+          child: actionButton(
+            'TOOL ZERO',
+            toolZero,
+            icon: Icons.build,
           ),
         ),
       ],
     );
   }
-
-  // الشاشة الرابعة: الملفات
 
   Widget buildFilesScreen() {
     return ListView(
@@ -914,18 +976,10 @@ class _MainScreenState extends State<MainScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(
-                Icons.insert_drive_file,
-                size: 45,
-                color: orange,
-              ),
+              const Icon(Icons.insert_drive_file, size: 45, color: orange),
               const SizedBox(height: 10),
               Text(fileName),
-              const SizedBox(height: 5),
-              Text(
-                fileInfo,
-                style: const TextStyle(color: Colors.white54),
-              ),
+              Text(fileInfo, style: const TextStyle(color: Colors.white54)),
               const SizedBox(height: 15),
               actionButton(
                 'اختيار ملف من الموبايل',
@@ -935,13 +989,28 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 10),
               actionButton(
                 'إرسال الملف إلى الكمبيوتر',
-                () => unavailable('إرسال الملف'),
+                () {
+                  if (fileContent.isEmpty) {
+                    notify('اختر ملفاً أولاً');
+                  } else {
+                    notify('المعاينة جاهزة - الإرسال الحقيقي غير مربوط');
+                  }
+                },
                 icon: Icons.upload,
               ),
               const SizedBox(height: 10),
               actionButton(
                 'تحميل الملف داخل Mach3',
-                () => unavailable('تحميل الملف'),
+                () {
+                  if (fileContent.isEmpty) {
+                    notify('اختر ملفاً أولاً');
+                  } else {
+                    setState(() {
+                      page = 0;
+                    });
+                    notify('تم تجهيز الملف للمحاكاة');
+                  }
+                },
                 icon: Icons.file_download,
               ),
             ],
@@ -950,22 +1019,10 @@ class _MainScreenState extends State<MainScreen> {
 
         panelBox(
           title: 'FILE CONTENT',
-          child: Container(
-            height: 250,
-            width: double.infinity,
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF10161D),
-              borderRadius: BorderRadius.circular(8),
-            ),
+          child: SizedBox(
+            height: 300,
             child: fileContent.isEmpty
-                ? const Center(
-                    child: Text(
-                      'اختر ملف G-code لعرض محتواه',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.white54),
-                    ),
-                  )
+                ? const Center(child: Text('اختر ملف G-code'))
                 : SingleChildScrollView(
                     child: SelectableText(
                       fileContent,
@@ -982,8 +1039,6 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  // الشاشة الخامسة: الاتصال
-
   Widget buildConnectionScreen() {
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -994,24 +1049,10 @@ class _MainScreenState extends State<MainScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text('عنوان الكمبيوتر'),
-              const SizedBox(height: 5),
-              Text(
-                ip,
-                style: const TextStyle(
-                  color: green,
-                  fontSize: 19,
-                ),
-              ),
+              Text(ip, style: const TextStyle(color: green, fontSize: 19)),
               const SizedBox(height: 12),
               const Text('Port'),
-              const SizedBox(height: 5),
-              Text(
-                port,
-                style: const TextStyle(
-                  color: green,
-                  fontSize: 19,
-                ),
-              ),
+              Text(port, style: const TextStyle(color: green, fontSize: 19)),
               const SizedBox(height: 15),
               actionButton(
                 'تعديل إعدادات الاتصال',
@@ -1033,43 +1074,34 @@ class _MainScreenState extends State<MainScreen> {
               ),
               const SizedBox(height: 10),
               Text(
-                connected ? 'متصل' : 'غير متصل',
+                connected ? 'متصل - وضع تجريبي' : 'غير متصل',
                 style: TextStyle(
                   color: connected ? green : red,
-                  fontSize: 20,
+                  fontSize: 19,
                 ),
               ),
               const SizedBox(height: 15),
               actionButton(
-                'اتصال بالكمبيوتر',
-                () => unavailable('الاتصال'),
+                connected ? 'فصل الاتصال التجريبي' : 'تفعيل الاتصال التجريبي',
+                toggleConnection,
                 icon: Icons.wifi,
-              ),
-              const SizedBox(height: 10),
-              actionButton(
-                'فصل الاتصال',
-                () {
-                  setState(() {
-                    connected = false;
-                  });
-                },
-                color: Colors.red.shade900,
-                icon: Icons.wifi_off,
               ),
             ],
           ),
         ),
 
         panelBox(
-          title: 'SYSTEM',
+          title: 'SYSTEM INFORMATION',
           child: const Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text('Controller: Mach3 Mill'),
               SizedBox(height: 8),
-              Text('Network: Wi-Fi Local Network'),
+              Text('Network: Wi-Fi'),
               SizedBox(height: 8),
-              Text('Protocol: WebSocket - سيتم تفعيله لاحقاً'),
+              Text('Mode: Local Simulation'),
+              SizedBox(height: 8),
+              Text('Protocol: WebSocket - غير مربوط حالياً'),
             ],
           ),
         ),
@@ -1105,23 +1137,16 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ),
         actions: [
-          Container(
-            margin: const EdgeInsets.symmetric(vertical: 7),
-            child: ElevatedButton.icon(
-              onPressed: emergencyStop,
-              icon: const Icon(
-                Icons.warning,
-                size: 17,
-              ),
-              label: const Text(
-                'E-STOP',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: red,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-              ),
+          ElevatedButton.icon(
+            onPressed: emergency ? resetEmergency : emergencyStop,
+            icon: Icon(
+              emergency ? Icons.lock_open : Icons.warning,
+              size: 17,
+            ),
+            label: Text(emergency ? 'RESET' : 'E-STOP'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: emergency ? green : red,
+              foregroundColor: Colors.white,
             ),
           ),
           IconButton(
@@ -1131,21 +1156,14 @@ class _MainScreenState extends State<MainScreen> {
         ],
       ),
 
-      body: SafeArea(
-        child: currentPage(),
-      ),
+      body: SafeArea(child: currentPage()),
 
       bottomNavigationBar: NavigationBar(
         selectedIndex: page,
-        onDestinationSelected: (index) {
-          setState(() {
-            page = index;
-          });
-        },
+        onDestinationSelected: (index) => setState(() => page = index),
         backgroundColor: const Color(0xFF202832),
         indicatorColor: green.withOpacity(0.18),
-        labelBehavior:
-            NavigationDestinationLabelBehavior.alwaysShow,
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.play_circle_outline),
@@ -1173,10 +1191,14 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
-// رسم تجريبي لمسار الأداة
-
 class ToolpathPainter extends CustomPainter {
-  const ToolpathPainter();
+  final double x;
+  final double y;
+
+  const ToolpathPainter({
+    required this.x,
+    required this.y,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1185,19 +1207,11 @@ class ToolpathPainter extends CustomPainter {
       ..strokeWidth = 0.6;
 
     for (double i = 0; i < size.width; i += 20) {
-      canvas.drawLine(
-        Offset(i, 0),
-        Offset(i, size.height),
-        gridPaint,
-      );
+      canvas.drawLine(Offset(i, 0), Offset(i, size.height), gridPaint);
     }
 
     for (double i = 0; i < size.height; i += 20) {
-      canvas.drawLine(
-        Offset(0, i),
-        Offset(size.width, i),
-        gridPaint,
-      );
+      canvas.drawLine(Offset(0, i), Offset(size.width, i), gridPaint);
     }
 
     final pathPaint = Paint()
@@ -1213,10 +1227,18 @@ class ToolpathPainter extends CustomPainter {
       ..close();
 
     canvas.drawPath(path, pathPaint);
+
+    final px = (size.width * 0.5 + x * 2)
+        .clamp(0.0, size.width).toDouble();
+    final py = (size.height * 0.5 - y * 2)
+        .clamp(0.0, size.height).toDouble();
+
+    final toolPaint = Paint()..color = orange;
+    canvas.drawCircle(Offset(px, py), 6, toolPaint);
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) {
-    return false;
+  bool shouldRepaint(covariant ToolpathPainter oldDelegate) {
+    return oldDelegate.x != x || oldDelegate.y != y;
   }
 }
