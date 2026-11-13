@@ -913,7 +913,10 @@ class _MainScreenState extends State<MainScreen> {
           setState(() => page = index);
         },
         backgroundColor: const Color(0xFF202832),
-        indicatorColor: green.withValues(alpha: 0.18),
+
+        // تم إصلاح السطر التالي ليتوافق مع Flutter 3.24
+        indicatorColor: green.withOpacity(0.18),
+
         labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
         destinations: const [
           NavigationDestination(
