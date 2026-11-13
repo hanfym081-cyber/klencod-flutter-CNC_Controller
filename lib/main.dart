@@ -33,6 +33,223 @@ class Mach3Remote extends StatelessWidget {
   }
 }
 
+// حركة واحدة مستخرجة من ملف G-code
+class ToolMove {
+  final int lineIndex;
+  final Offset start;
+  final Offset end;
+  final bool rapid;
+  final List<Offset> points;
+
+  const ToolMove({
+    required this.lineIndex,
+    required this.start,
+    required this.end,
+    required this.rapid,
+    required this.points,
+  });
+}
+
+// نتيجة تحليل ملف G-code
+class ToolpathData {
+  final List<ToolMove> moves;
+  final List<Offset> allPoints;
+  final double minX;
+  final double maxX;
+  final double minY;
+  final double maxY;
+
+  const ToolpathData({
+    required this.moves,
+    required this.allPoints,
+    required this.minX,
+    required this.maxX,
+    required this.minY,
+    required this.maxY,
+  });
+}
+
+class GCodeParser {
+  static ToolpathData parse(List<String> lines) {
+    double x = 0, y = 0, z = 0;
+    double unit = 1;
+    bool absolute = true;
+    int motion = 0;
+
+    final moves = <ToolMove>[];
+    final allPoints = <Offset>[Offset.zero];
+
+    double minX = 0, maxX = 0;
+    double minY = 0, maxY = 0;
+
+    void addPoint(Offset p) {
+      allPoints.add(p);
+      minX = math.min(minX, p.dx);
+      maxX = math.max(maxX, p.dx);
+      minY = math.min(minY, p.dy);
+      maxY = math.max(maxY, p.dy);
+    }
+
+    final numberPattern = RegExp(
+      r'([A-Z])\s*(-?\d+(?:\.\d*)?|-?\.\d+)',
+      caseSensitive: false,
+    );
+
+    for (int lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      String source = lines[lineIndex]
+          .replaceAll(RegExp(r'\([^)]*\)'), '')
+          .split(';')
+          .first
+          .toUpperCase();
+
+      final words = <String, double>{};
+
+      for (final match in numberPattern.allMatches(source)) {
+        final letter = match.group(1)!;
+        final value = double.tryParse(match.group(2)!);
+        if (value != null) words[letter] = value;
+      }
+
+      // وحدات القياس
+      if (words['G'] == 20) unit = 25.4;
+      if (words['G'] == 21) unit = 1;
+
+      // إحداثيات مطلقة أو نسبية
+      if (RegExp(r'G\s*90(?:\D|$)').hasMatch(source)) {
+        absolute = true;
+      }
+      if (RegExp(r'G\s*91(?:\D|$)').hasMatch(source)) {
+        absolute = false;
+      }
+
+      // نوع الحركة
+      final gCodes = RegExp(r'G\s*(0|1|2|3)\b')
+          .allMatches(source);
+
+      for (final match in gCodes) {
+        motion = int.parse(match.group(1)!);
+      }
+
+      final hasAxis = words.containsKey('X') ||
+          words.containsKey('Y') ||
+          words.containsKey('Z');
+
+      if (!hasAxis) continue;
+      if (motion != 0 && motion != 1 &&
+          motion != 2 && motion != 3) {
+        continue;
+      }
+
+      final oldX = x;
+      final oldY = y;
+      final oldZ = z;
+
+      if (words.containsKey('X')) {
+        final v = words['X']! * unit;
+        x = absolute ? v : x + v;
+      }
+
+      if (words.containsKey('Y')) {
+        final v = words['Y']! * unit;
+        y = absolute ? v : y + v;
+      }
+
+      if (words.containsKey('Z')) {
+        final v = words['Z']! * unit;
+        z = absolute ? v : z + v;
+      }
+
+      final start = Offset(oldX, oldY);
+      final end = Offset(x, y);
+
+      // لا نرسم حركة لا تغيّر موضع XY
+      if ((end - start).distance < 0.0000001) {
+        continue;
+      }
+
+      final points = <Offset>[start];
+
+      if (motion == 2 || motion == 3) {
+        // G2/G3 باستخدام I و J بالنسبة لنقطة البداية
+        final i = (words['I'] ?? 0) * unit;
+        final j = (words['J'] ?? 0) * unit;
+
+        final center = Offset(oldX + i, oldY + j);
+        final radius = (start - center).distance;
+
+        if (radius > 0.000001 && (words.containsKey('I') ||
+            words.containsKey('J'))) {
+          final startAngle = math.atan2(
+            start.dy - center.dy,
+            start.dx - center.dx,
+          );
+
+          final endAngle = math.atan2(
+            end.dy - center.dy,
+            end.dx - center.dx,
+          );
+
+          double sweep = endAngle - startAngle;
+
+          if (motion == 2) {
+            while (sweep >= 0) {
+              sweep -= 2 * math.pi;
+            }
+          } else {
+            while (sweep <= 0) {
+              sweep += 2 * math.pi;
+            }
+          }
+
+          final segments = math.max(
+            12,
+            (sweep.abs() * radius / 2).ceil(),
+          );
+
+          for (int n = 1; n <= segments; n++) {
+            final angle = startAngle + sweep * n / segments;
+            points.add(
+              Offset(
+                center.dx + radius * math.cos(angle),
+                center.dy + radius * math.sin(angle),
+              ),
+            );
+          }
+
+          points[points.length - 1] = end;
+        } else {
+          points.add(end);
+        }
+      } else {
+        points.add(end);
+      }
+
+      final move = ToolMove(
+        lineIndex: lineIndex,
+        start: start,
+        end: end,
+        rapid: motion == 0,
+        points: points,
+      );
+
+      moves.add(move);
+
+      for (final p in points) {
+        addPoint(p);
+      }
+    }
+
+    return ToolpathData(
+      moves: moves,
+      allPoints: allPoints,
+      minX: minX,
+      maxX: maxX,
+      minY: minY,
+      maxY: maxY,
+    );
+  }
+}
+
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
 
@@ -75,11 +292,9 @@ class _MainScreenState extends State<MainScreen> {
   double feedOverride = 100;
   double spindleOverride = 100;
 
-  // قيم F و S المبرمجة من ملف G-code
   double programmedFeed = 0;
   double programmedRpm = 0;
 
-  // القيم المحسوبة بعد تطبيق Override
   double get actualFeed => programmedFeed * feedOverride / 100;
 
   double get actualRpm =>
@@ -90,6 +305,10 @@ class _MainScreenState extends State<MainScreen> {
   Timer? programTimer;
 
   final ScrollController lineScrollController = ScrollController();
+
+  ToolpathData? toolpath;
+  int executedMoves = 0;
+  Offset toolPosition = Offset.zero;
 
   final Map<String, Map<String, double>> offsets = {
     for (final code in ['G54', 'G55', 'G56', 'G57', 'G58', 'G59'])
@@ -212,7 +431,6 @@ class _MainScreenState extends State<MainScreen> {
       offsets[workCoordinate]!['X'] = machineX;
       offsets[workCoordinate]!['Y'] = machineY;
       offsets[workCoordinate]!['Z'] = machineZ;
-
       updateWorkCoordinates();
     });
 
@@ -260,38 +478,52 @@ class _MainScreenState extends State<MainScreen> {
       }
 
       final content = String.fromCharCodes(bytes);
+      final lines = content
+          .split(RegExp(r'\r?\n'))
+          .where((line) => line.trim().isNotEmpty)
+          .toList();
+
+      final parsed = GCodeParser.parse(lines);
 
       setState(() {
         fileName = selected.name;
         fileInfo =
             'الحجم: ${(selected.size / 1024).toStringAsFixed(1)} KB';
-
         fileContent = content;
-
-        gcodeLines = content
-            .split(RegExp(r'\r?\n'))
-            .where((line) => line.trim().isNotEmpty)
-            .toList();
+        gcodeLines = lines;
 
         currentLine = 0;
+        executedMoves = 0;
+
+        toolpath = parsed;
+        toolPosition = parsed.allPoints.isNotEmpty
+            ? parsed.allPoints.first
+            : Offset.zero;
 
         programmedFeed = 0;
         programmedRpm = 0;
         spindleOn = false;
+
+        programRunning = false;
+        feedHold = false;
       });
+
+      programTimer?.cancel();
 
       if (lineScrollController.hasClients) {
         lineScrollController.jumpTo(0);
       }
 
-      notify('تم تحميل الملف: ${selected.name}');
+      if (parsed.moves.isEmpty) {
+        notify('تم تحميل الملف، لكن لم يتم العثور على حركات XY');
+      } else {
+        notify('تم تحميل المسار: ${parsed.moves.length} حركة');
+      }
     } catch (e) {
-      notify('حدث خطأ أثناء فتح الملف');
+      notify('حدث خطأ أثناء فتح الملف: $e');
     }
   }
 
-  // قراءة قيمة محور أو أمر F أو S من سطر G-code
-  // مع تجاهل التعليقات والأجزاء التي تأتي بعد ;
   double? readAxisValue(String line, String axis) {
     final cleanLine = line
         .replaceAll(RegExp(r'\([^)]*\)'), '')
@@ -304,11 +536,9 @@ class _MainScreenState extends State<MainScreen> {
     ).firstMatch(cleanLine);
 
     if (match == null) return null;
-
     return double.tryParse(match.group(1)!);
   }
 
-  // قراءة أوامر M3 و M4 و M5
   int? readMCode(String line) {
     final cleanLine = line
         .replaceAll(RegExp(r'\([^)]*\)'), '')
@@ -316,44 +546,55 @@ class _MainScreenState extends State<MainScreen> {
         .first;
 
     final match = RegExp(
-      r'(?:^|\s)M\s*(3|4|5)(?=\s|$)',
+      r'M\s*(3|4|5)\b',
       caseSensitive: false,
     ).firstMatch(cleanLine);
 
     if (match == null) return null;
-
     return int.tryParse(match.group(1)!);
   }
 
   void executeSimulationLine(String line) {
-    final x = readAxisValue(line, 'X');
-    final y = readAxisValue(line, 'Y');
-    final z = readAxisValue(line, 'Z');
     final f = readAxisValue(line, 'F');
     final s = readAxisValue(line, 'S');
     final m = readMCode(line);
 
-    setState(() {
-      if (x != null) machineX = x;
-      if (y != null) machineY = y;
-      if (z != null) machineZ = z;
+    // موضع الأداة يُؤخذ من الحركات المحللة مسبقاً
+    final moves = toolpath?.moves ?? [];
 
-      // F و S أوامر مستمرة حتى ورود قيمة جديدة
+    int completed = 0;
+
+    for (final move in moves) {
+      if (move.lineIndex < currentLine) {
+        completed++;
+      } else {
+        break;
+      }
+    }
+
+    setState(() {
       if (f != null) programmedFeed = f;
       if (s != null) programmedRpm = s;
 
-      // M3 و M4 تشغيل، و M5 إيقاف
       if (m == 3 || m == 4) {
         spindleOn = true;
       } else if (m == 5) {
         spindleOn = false;
       }
 
+      executedMoves = completed;
+
+      if (completed > 0 && completed <= moves.length) {
+        final move = moves[completed - 1];
+        toolPosition = move.end;
+        machineX = move.end.dx;
+        machineY = move.end.dy;
+      }
+
       updateWorkCoordinates();
     });
   }
 
-  // إبقاء السطر الجاري داخل نافذة العرض
   void keepCurrentLineVisible() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !lineScrollController.hasClients) return;
@@ -362,7 +603,6 @@ class _MainScreenState extends State<MainScreen> {
       const visibleLinesAbove = 4;
 
       final activeIndex = currentLine - 1;
-
       if (activeIndex < 0) return;
 
       final targetOffset =
@@ -402,6 +642,17 @@ class _MainScreenState extends State<MainScreen> {
       return;
     }
 
+    if (currentLine >= gcodeLines.length) {
+      setState(() {
+        currentLine = 0;
+        executedMoves = 0;
+        toolPosition = toolpath?.allPoints.first ?? Offset.zero;
+        programmedFeed = 0;
+        programmedRpm = 0;
+        spindleOn = false;
+      });
+    }
+
     programTimer?.cancel();
 
     setState(() {
@@ -427,6 +678,7 @@ class _MainScreenState extends State<MainScreen> {
           setState(() {
             programRunning = false;
             currentLine = gcodeLines.length;
+            executedMoves = toolpath?.moves.length ?? 0;
           });
 
           notify('اكتملت محاكاة البرنامج');
@@ -467,7 +719,9 @@ class _MainScreenState extends State<MainScreen> {
       programRunning = false;
       feedHold = false;
       currentLine = 0;
+      executedMoves = 0;
       spindleOn = false;
+      toolPosition = toolpath?.allPoints.first ?? Offset.zero;
     });
 
     if (lineScrollController.hasClients) {
@@ -653,7 +907,7 @@ class _MainScreenState extends State<MainScreen> {
             const SizedBox(height: 7),
             FittedBox(
               child: Text(
-                value.toStringAsFixed(3),
+                value.toStringAsFixed(4),
                 style: const TextStyle(
                   fontFamily: 'monospace',
                   color: green,
@@ -738,22 +992,44 @@ class _MainScreenState extends State<MainScreen> {
 
         panelBox(
           title: 'TOOLPATH DISPLAY',
-          child: SizedBox(
-            height: 190,
-            child: CustomPaint(
-              painter: ToolpathPainter(
-                x: workX,
-                y: workY,
-              ),
-              child: Center(
-                child: Text(
-                  gcodeLines.isEmpty
-                      ? 'اختر ملفاً لبدء المحاكاة'
-                      : 'موضع الأداة في المحاكاة',
-                  style: const TextStyle(color: Colors.white54),
+          child: Column(
+            children: [
+              SizedBox(
+                height: 230,
+                width: double.infinity,
+                child: CustomPaint(
+                  painter: ToolpathPainter(
+                    data: toolpath,
+                    executedMoves: executedMoves,
+                    toolPosition: toolPosition,
+                  ),
+                  child: toolpath == null
+                      ? const Center(
+                          child: Text(
+                            'اختر ملف G-code لعرض المسار',
+                            style: TextStyle(color: Colors.white54),
+                          ),
+                        )
+                      : null,
                 ),
               ),
-            ),
+              const SizedBox(height: 8),
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 16,
+                children: const [
+                  LegendDot(color: Colors.white54, text: 'المسار الكامل'),
+                  LegendDot(color: green, text: 'تم تنفيذه'),
+                  LegendDot(color: orange, text: 'موضع الأداة'),
+                  LegendDot(color: Colors.blueAccent, text: 'حركة G0'),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'الحركات: $executedMoves / ${toolpath?.moves.length ?? 0}',
+                style: const TextStyle(color: Colors.white70),
+              ),
+            ],
           ),
         ),
 
@@ -853,7 +1129,6 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ),
 
-        // عداد التغذية
         panelBox(
           title: 'FEED RATE',
           child: Column(
@@ -898,7 +1173,6 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ),
 
-        // عداد سرعة الإسبندل
         panelBox(
           title: 'SPINDLE SPEED',
           child: Column(
@@ -1002,7 +1276,6 @@ class _MainScreenState extends State<MainScreen> {
           y: workY,
           z: workZ,
         ),
-
         panelBox(
           title: 'SELECT AXIS',
           child: Row(
@@ -1016,7 +1289,6 @@ class _MainScreenState extends State<MainScreen> {
             }).toList(),
           ),
         ),
-
         panelBox(
           title: 'JOG STEP',
           child: DropdownButtonFormField<String>(
@@ -1036,7 +1308,6 @@ class _MainScreenState extends State<MainScreen> {
             },
           ),
         ),
-
         panelBox(
           title: 'JOG CONTROL - $selectedAxis',
           child: Row(
@@ -1060,7 +1331,6 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
-
         panelBox(
           title: 'JOG SPEED',
           child: Column(
@@ -1078,7 +1348,6 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
-
         zeroButtons(),
       ],
     );
@@ -1100,7 +1369,6 @@ class _MainScreenState extends State<MainScreen> {
           y: workY,
           z: workZ,
         ),
-
         panelBox(
           title: 'WORK OFFSET',
           child: DropdownButtonFormField<String>(
@@ -1114,7 +1382,6 @@ class _MainScreenState extends State<MainScreen> {
             onChanged: changeWorkCoordinate,
           ),
         ),
-
         panelBox(
           title: 'CURRENT OFFSET VALUES',
           child: Row(
@@ -1125,9 +1392,7 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
-
         zeroButtons(),
-
         panelBox(
           title: 'TOOL OFFSET',
           child: actionButton(
@@ -1193,7 +1458,6 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
-
         panelBox(
           title: 'FILE CONTENT',
           child: SizedBox(
@@ -1245,7 +1509,6 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
-
         panelBox(
           title: 'CONNECTION STATUS',
           child: Column(
@@ -1274,7 +1537,6 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
-
         panelBox(
           title: 'SYSTEM INFORMATION',
           child: const Column(
@@ -1340,9 +1602,7 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ],
       ),
-
       body: SafeArea(child: currentPage()),
-
       bottomNavigationBar: NavigationBar(
         selectedIndex: page,
         onDestinationSelected: (index) => setState(() => page = index),
@@ -1376,19 +1636,57 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
+class LegendDot extends StatelessWidget {
+  final Color color;
+  final String text;
+
+  const LegendDot({
+    super.key,
+    required this.color,
+    required this.text,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 9,
+          height: 9,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+          ),
+        ),
+        const SizedBox(width: 4),
+        Text(
+          text,
+          style: const TextStyle(
+            color: Colors.white70,
+            fontSize: 10,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class ToolpathPainter extends CustomPainter {
-  final double x;
-  final double y;
+  final ToolpathData? data;
+  final int executedMoves;
+  final Offset toolPosition;
 
   const ToolpathPainter({
-    required this.x,
-    required this.y,
+    required this.data,
+    required this.executedMoves,
+    required this.toolPosition,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
     final gridPaint = Paint()
-      ..color = Colors.white12
+      ..color = Colors.white.withOpacity(0.07)
       ..strokeWidth = 0.6;
 
     for (double i = 0; i < size.width; i += 20) {
@@ -1407,35 +1705,128 @@ class ToolpathPainter extends CustomPainter {
       );
     }
 
-    final pathPaint = Paint()
-      ..color = green
+    final result = data;
+
+    if (result == null || result.moves.isEmpty) {
+      return;
+    }
+
+    const margin = 22.0;
+
+    final availableWidth = math.max(1.0, size.width - margin * 2);
+    final availableHeight = math.max(1.0, size.height - margin * 2);
+
+    final rangeX = math.max(0.001, result.maxX - result.minX);
+    final rangeY = math.max(0.001, result.maxY - result.minY);
+
+    final scale = math.min(
+      availableWidth / rangeX,
+      availableHeight / rangeY,
+    );
+
+    final drawWidth = rangeX * scale;
+    final drawHeight = rangeY * scale;
+
+    final left = (size.width - drawWidth) / 2;
+    final top = (size.height - drawHeight) / 2;
+
+    Offset convert(Offset p) {
+      return Offset(
+        left + (p.dx - result.minX) * scale,
+        size.height - top - (p.dy - result.minY) * scale,
+      );
+    }
+
+    // رسم شبكة المحاور وحدود مساحة العمل
+    final borderPaint = Paint()
+      ..color = Colors.white24
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+
+    canvas.drawRect(
+      Rect.fromLTWH(left, top, drawWidth, drawHeight),
+      borderPaint,
+    );
+
+    // رسم المسار الكامل بلون رمادي
+    final remainingPaint = Paint()
+      ..color = Colors.white38
       ..strokeWidth = 2
-      ..style = PaintingStyle.stroke;
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
 
-    final path = Path()
-      ..moveTo(size.width * 0.2, size.height * 0.3)
-      ..lineTo(size.width * 0.8, size.height * 0.3)
-      ..lineTo(size.width * 0.8, size.height * 0.7)
-      ..lineTo(size.width * 0.2, size.height * 0.7)
-      ..close();
+    // المسار المنفذ
+    final executedPaint = Paint()
+      ..color = green
+      ..strokeWidth = 3
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
 
-    canvas.drawPath(path, pathPaint);
+    // حركة G0 السريعة
+    final rapidPaint = Paint()
+      ..color = Colors.blueAccent
+      ..strokeWidth = 1.8
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
 
-    final px = (size.width * 0.5 + x * 2)
-        .clamp(0.0, size.width)
-        .toDouble();
+    for (int i = 0; i < result.moves.length; i++) {
+      final move = result.moves[i];
 
-    final py = (size.height * 0.5 - y * 2)
-        .clamp(0.0, size.height)
-        .toDouble();
+      final path = Path();
+
+      if (move.points.isNotEmpty) {
+        path.moveTo(
+          convert(move.points.first).dx,
+          convert(move.points.first).dy,
+        );
+
+        for (int j = 1; j < move.points.length; j++) {
+          final p = convert(move.points[j]);
+          path.lineTo(p.dx, p.dy);
+        }
+      }
+
+      if (i < executedMoves) {
+        canvas.drawPath(path, executedPaint);
+      } else if (move.rapid) {
+        canvas.drawPath(path, rapidPaint);
+      } else {
+        canvas.drawPath(path, remainingPaint);
+      }
+    }
+
+    // موضع بداية المسار
+    final startPoint = convert(result.moves.first.start);
+
+    canvas.drawCircle(
+      startPoint,
+      4,
+      Paint()..color = Colors.white,
+    );
+
+    // موضع الأداة الحالي
+    final currentPoint = convert(toolPosition);
 
     final toolPaint = Paint()..color = orange;
 
-    canvas.drawCircle(Offset(px, py), 6, toolPaint);
+    canvas.drawCircle(currentPoint, 7, toolPaint);
+
+    canvas.drawCircle(
+      currentPoint,
+      11,
+      Paint()
+        ..color = orange.withOpacity(0.35)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
   }
 
   @override
   bool shouldRepaint(covariant ToolpathPainter oldDelegate) {
-    return oldDelegate.x != x || oldDelegate.y != y;
+    return oldDelegate.data != data ||
+        oldDelegate.executedMoves != executedMoves ||
+        oldDelegate.toolPosition != toolPosition;
   }
 }
