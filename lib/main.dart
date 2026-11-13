@@ -56,21 +56,24 @@ class _MainScreenState extends State<MainScreen> {
 
   String fileName = 'لم يتم اختيار ملف';
   String fileInfo = '';
+  String fileContent = '';
 
-  double x = 0;
-  double y = 0;
-  double z = 0;
+  double machineX = 0;
+  double machineY = 0;
+  double machineZ = 0;
 
-  // متغيرات السرعات المستقلة
+  double workX = 0;
+  double workY = 0;
+  double workZ = 0;
+
   double jogSpeed = 50;
   double feedOverride = 100;
-
   double rpm = 0;
   double spindleOverride = 100;
 
   final List<String> pageTitles = [
     'PROGRAM RUN',
-    'JOG / SPEED',
+    'MANUAL JOG',
     'WORK OFFSETS',
     'FILES',
     'CONNECTION',
@@ -123,9 +126,7 @@ class _MainScreenState extends State<MainScreen> {
   }
 
   void unavailable(String command) {
-    notify(
-      '$command: سيتم تفعيله بعد تجهيز برنامج Windows',
-    );
+    notify('$command: سيتم تفعيله بعد تجهيز برنامج Windows');
   }
 
   Future<void> showSettings() async {
@@ -160,9 +161,7 @@ class _MainScreenState extends State<MainScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.pop(dialogContext);
-            },
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('إلغاء'),
           ),
           ElevatedButton(
@@ -211,9 +210,7 @@ class _MainScreenState extends State<MainScreen> {
         withData: true,
       );
 
-      if (result == null || result.files.isEmpty) {
-        return;
-      }
+      if (result == null || result.files.isEmpty) return;
 
       final selected = result.files.first;
 
@@ -221,11 +218,15 @@ class _MainScreenState extends State<MainScreen> {
         fileName = selected.name;
         fileInfo =
             'الحجم: ${(selected.size / 1024).toStringAsFixed(1)} KB';
+
+        if (selected.bytes != null) {
+          fileContent = String.fromCharCodes(selected.bytes!);
+        } else {
+          fileContent = 'تعذرت قراءة محتويات الملف';
+        }
       });
 
-      notify(
-        'تم اختيار الملف. إرساله للكمبيوتر سيتم تفعيله لاحقاً',
-      );
+      notify('تم اختيار الملف');
     } catch (e) {
       notify('تعذر فتح الملف');
     }
@@ -240,6 +241,24 @@ class _MainScreenState extends State<MainScreen> {
     unavailable('تحريك المحور $axis');
   }
 
+  void zeroAxis(String axis) {
+    if (!connected) {
+      notify('اتصل بالكمبيوتر أولاً');
+      return;
+    }
+
+    unavailable('تصفير المحور $axis');
+  }
+
+  void zeroAll() {
+    if (!connected) {
+      notify('اتصل بالكمبيوتر أولاً');
+      return;
+    }
+
+    unavailable('تصفير جميع المحاور');
+  }
+
   void emergencyStop() {
     showDialog(
       context: context,
@@ -250,14 +269,12 @@ class _MainScreenState extends State<MainScreen> {
           style: TextStyle(color: red),
         ),
         content: const Text(
-          'هذا الزر لم يتم ربطه بعد ببرنامج Mach3. '
+          'زر الطوارئ غير مربوط حتى الآن ببرنامج Mach3. '
           'ولا يغني عن دائرة الطوارئ المادية المستقلة.',
         ),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.pop(dialogContext);
-            },
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('إغلاق'),
           ),
         ],
@@ -304,18 +321,14 @@ class _MainScreenState extends State<MainScreen> {
   }) {
     return SizedBox(
       height: 48,
+      width: double.infinity,
       child: ElevatedButton.icon(
         onPressed: action,
-        icon: Icon(
-          icon ?? Icons.circle,
-          size: 16,
-        ),
+        icon: Icon(icon ?? Icons.circle, size: 16),
         label: Text(
           text,
           textAlign: TextAlign.center,
-          style: const TextStyle(
-            fontWeight: FontWeight.bold,
-          ),
+          style: const TextStyle(fontWeight: FontWeight.bold),
         ),
         style: ElevatedButton.styleFrom(
           backgroundColor: color,
@@ -368,7 +381,65 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  // الشاشة الأولى: البرنامج
+  Widget coordinatesPanel({
+    required String title,
+    required double x,
+    required double y,
+    required double z,
+  }) {
+    return panelBox(
+      title: title,
+      child: Row(
+        children: [
+          valueBox('X', x),
+          valueBox('Y', y),
+          valueBox('Z', z),
+        ],
+      ),
+    );
+  }
+
+  Widget zeroButtons() {
+    return panelBox(
+      title: 'ZERO AXIS',
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: actionButton(
+                  'ZERO X',
+                  () => zeroAxis('X'),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: actionButton(
+                  'ZERO Y',
+                  () => zeroAxis('Y'),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: actionButton(
+                  'ZERO Z',
+                  () => zeroAxis('Z'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          actionButton(
+            'ZERO ALL',
+            zeroAll,
+            color: const Color(0xFF167A42),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // الشاشة الأولى: تشغيل البرنامج
 
   Widget buildProgramScreen() {
     return ListView(
@@ -383,9 +454,7 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 5),
               Text(
                 fileInfo,
-                style: const TextStyle(
-                  color: Colors.white54,
-                ),
+                style: const TextStyle(color: Colors.white54),
               ),
               const SizedBox(height: 12),
               actionButton(
@@ -418,6 +487,44 @@ class _MainScreenState extends State<MainScreen> {
                 ),
               ),
             ),
+          ),
+        ),
+
+        coordinatesPanel(
+          title: 'WORK COORDINATES',
+          x: workX,
+          y: workY,
+          z: workZ,
+        ),
+
+        panelBox(
+          title: 'G-CODE LINES',
+          child: Container(
+            height: 180,
+            width: double.infinity,
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF10161D),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: fileContent.isEmpty
+                ? const Center(
+                    child: Text(
+                      'سيظهر كود G-code هنا بعد اختيار الملف',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.white54),
+                    ),
+                  )
+                : SingleChildScrollView(
+                    child: SelectableText(
+                      fileContent,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        color: green,
+                      ),
+                    ),
+                  ),
           ),
         ),
 
@@ -458,8 +565,122 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 8),
               const Text(
                 'السطر الحالي: --     التقدم: 0%',
-                style: TextStyle(
-                  color: Colors.white54,
+                style: TextStyle(color: Colors.white54),
+              ),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'FEED RATE OVERRIDE',
+          child: Column(
+            children: [
+              Text(
+                '${feedOverride.toInt()}%',
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
+              ),
+              Slider(
+                value: feedOverride.clamp(10, 150).toDouble(),
+                min: 10,
+                max: 150,
+                onChanged: (v) {
+                  setState(() {
+                    feedOverride = v;
+                  });
+                },
+              ),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'SPINDLE',
+          child: Column(
+            children: [
+              Text(
+                'RPM: ${rpm.toInt()}',
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
+              ),
+              Slider(
+                value: rpm.clamp(0, 10000).toDouble(),
+                min: 0,
+                max: 10000,
+                onChanged: (v) {
+                  setState(() {
+                    rpm = v;
+                  });
+                },
+              ),
+              Row(
+                children: [
+                  Expanded(
+                    child: actionButton(
+                      'SPINDLE ON',
+                      () => unavailable('Spindle On'),
+                      color: const Color(0xFF167A42),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: actionButton(
+                      'SPINDLE OFF',
+                      () => unavailable('Spindle Off'),
+                      color: Colors.red.shade900,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'SPINDLE OVERRIDE',
+          child: Column(
+            children: [
+              Text(
+                '${spindleOverride.toInt()}%',
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
+              ),
+              Slider(
+                value: spindleOverride.clamp(50, 150).toDouble(),
+                min: 50,
+                max: 150,
+                onChanged: (v) {
+                  setState(() {
+                    spindleOverride = v;
+                  });
+                },
+              ),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'COOLANT',
+          child: Row(
+            children: [
+              Expanded(
+                child: actionButton(
+                  'COOLANT ON',
+                  () => unavailable('Coolant On'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: actionButton(
+                  'COOLANT OFF',
+                  () => unavailable('Coolant Off'),
+                  color: Colors.red.shade900,
                 ),
               ),
             ],
@@ -469,32 +690,24 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  // الشاشة الثانية: الحركة والإحداثيات والسرعات
+  // الشاشة الثانية: التحكم اليدوي
 
-  Widget buildJogSpeedScreen() {
+  Widget buildJogScreen() {
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
-        panelBox(
+        coordinatesPanel(
           title: 'MACHINE COORDINATES',
-          child: Row(
-            children: [
-              valueBox('X', x),
-              valueBox('Y', y),
-              valueBox('Z', z),
-            ],
-          ),
+          x: machineX,
+          y: machineY,
+          z: machineZ,
         ),
 
-        panelBox(
+        coordinatesPanel(
           title: 'WORK COORDINATES',
-          child: Row(
-            children: [
-              valueBox('X', 0),
-              valueBox('Y', 0),
-              valueBox('Z', 0),
-            ],
-          ),
+          x: workX,
+          y: workY,
+          z: workZ,
         ),
 
         panelBox(
@@ -605,122 +818,7 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ),
 
-        panelBox(
-          title: 'SPINDLE',
-          child: Column(
-            children: [
-              Text(
-                'RPM: ${rpm.toInt()}',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
-              ),
-              Slider(
-                value: rpm,
-                min: 0,
-                max: 10000,
-                onChanged: (v) {
-                  setState(() {
-                    rpm = v;
-                  });
-                },
-              ),
-              Row(
-                children: [
-                  Expanded(
-                    child: actionButton(
-                      'SPINDLE ON',
-                      () => unavailable('Spindle On'),
-                      color: const Color(0xFF167A42),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: actionButton(
-                      'SPINDLE OFF',
-                      () => unavailable('Spindle Off'),
-                      color: Colors.red.shade900,
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-
-        panelBox(
-          title: 'FEED RATE OVERRIDE',
-          child: Column(
-            children: [
-              Text(
-                '${feedOverride.toInt()}%',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
-              ),
-              Slider(
-                value: feedOverride.clamp(10, 150).toDouble(),
-                min: 10,
-                max: 150,
-                onChanged: (v) {
-                  setState(() {
-                    feedOverride = v;
-                  });
-                },
-              ),
-              const Text('Feed Override'),
-            ],
-          ),
-        ),
-
-        panelBox(
-          title: 'SPINDLE OVERRIDE',
-          child: Column(
-            children: [
-              Text(
-                '${spindleOverride.toInt()}%',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
-              ),
-              Slider(
-                value: spindleOverride,
-                min: 50,
-                max: 150,
-                onChanged: (v) {
-                  setState(() {
-                    spindleOverride = v;
-                  });
-                },
-              ),
-            ],
-          ),
-        ),
-
-        panelBox(
-          title: 'COOLANT',
-          child: Row(
-            children: [
-              Expanded(
-                child: actionButton(
-                  'COOLANT ON',
-                  () => unavailable('Coolant On'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: actionButton(
-                  'COOLANT OFF',
-                  () => unavailable('Coolant Off'),
-                  color: Colors.red.shade900,
-                ),
-              ),
-            ],
-          ),
-        ),
+        zeroButtons(),
       ],
     );
   }
@@ -731,6 +829,20 @@ class _MainScreenState extends State<MainScreen> {
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
+        coordinatesPanel(
+          title: 'MACHINE COORDINATES',
+          x: machineX,
+          y: machineY,
+          z: machineZ,
+        ),
+
+        coordinatesPanel(
+          title: 'WORK COORDINATES',
+          x: workX,
+          y: workY,
+          z: workZ,
+        ),
+
         panelBox(
           title: 'WORK OFFSET',
           child: Column(
@@ -768,43 +880,7 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ),
 
-        panelBox(
-          title: 'ZERO AXIS',
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: actionButton(
-                      'ZERO X',
-                      () => unavailable('Zero X'),
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: actionButton(
-                      'ZERO Y',
-                      () => unavailable('Zero Y'),
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: actionButton(
-                      'ZERO Z',
-                      () => unavailable('Zero Z'),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              actionButton(
-                'ZERO ALL',
-                () => unavailable('Zero All'),
-                color: const Color(0xFF167A42),
-              ),
-            ],
-          ),
-        ),
+        zeroButtons(),
 
         panelBox(
           title: 'TOOL OFFSET',
@@ -812,9 +888,7 @@ class _MainScreenState extends State<MainScreen> {
             children: [
               const Text(
                 'إعداد صفر الأداة',
-                style: TextStyle(
-                  color: Colors.white70,
-                ),
+                style: TextStyle(color: Colors.white70),
               ),
               const SizedBox(height: 12),
               actionButton(
@@ -850,9 +924,7 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 5),
               Text(
                 fileInfo,
-                style: const TextStyle(
-                  color: Colors.white54,
-                ),
+                style: const TextStyle(color: Colors.white54),
               ),
               const SizedBox(height: 15),
               actionButton(
@@ -878,17 +950,32 @@ class _MainScreenState extends State<MainScreen> {
 
         panelBox(
           title: 'FILE CONTENT',
-          child: const SizedBox(
-            height: 120,
-            child: Center(
-              child: Text(
-                'سيظهر محتوى G-code بعد تجهيز قارئ الملفات',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white54,
-                ),
-              ),
+          child: Container(
+            height: 250,
+            width: double.infinity,
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF10161D),
+              borderRadius: BorderRadius.circular(8),
             ),
+            child: fileContent.isEmpty
+                ? const Center(
+                    child: Text(
+                      'اختر ملف G-code لعرض محتواه',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.white54),
+                    ),
+                  )
+                : SingleChildScrollView(
+                    child: SelectableText(
+                      fileContent,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        color: green,
+                      ),
+                    ),
+                  ),
           ),
         ),
       ],
@@ -982,9 +1069,7 @@ class _MainScreenState extends State<MainScreen> {
               SizedBox(height: 8),
               Text('Network: Wi-Fi Local Network'),
               SizedBox(height: 8),
-              Text(
-                'Protocol: WebSocket - سيتم تفعيله لاحقاً',
-              ),
+              Text('Protocol: WebSocket - سيتم تفعيله لاحقاً'),
             ],
           ),
         ),
@@ -992,14 +1077,12 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  // تحديد الشاشة الحالية
-
   Widget currentPage() {
     switch (page) {
       case 0:
         return buildProgramScreen();
       case 1:
-        return buildJogSpeedScreen();
+        return buildJogScreen();
       case 2:
         return buildOffsetsScreen();
       case 3:
@@ -1032,16 +1115,12 @@ class _MainScreenState extends State<MainScreen> {
               ),
               label: const Text(
                 'E-STOP',
-                style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                ),
+                style: TextStyle(fontWeight: FontWeight.bold),
               ),
               style: ElevatedButton.styleFrom(
                 backgroundColor: red,
                 foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                ),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
               ),
             ),
           ),
@@ -1074,7 +1153,7 @@ class _MainScreenState extends State<MainScreen> {
           ),
           NavigationDestination(
             icon: Icon(Icons.gamepad),
-            label: 'الحركة والسرعات',
+            label: 'الحركة اليدوية',
           ),
           NavigationDestination(
             icon: Icon(Icons.tune),
@@ -1127,31 +1206,17 @@ class ToolpathPainter extends CustomPainter {
       ..style = PaintingStyle.stroke;
 
     final path = Path()
-      ..moveTo(
-        size.width * 0.2,
-        size.height * 0.3,
-      )
-      ..lineTo(
-        size.width * 0.8,
-        size.height * 0.3,
-      )
-      ..lineTo(
-        size.width * 0.8,
-        size.height * 0.7,
-      )
-      ..lineTo(
-        size.width * 0.2,
-        size.height * 0.7,
-      )
+      ..moveTo(size.width * 0.2, size.height * 0.3)
+      ..lineTo(size.width * 0.8, size.height * 0.3)
+      ..lineTo(size.width * 0.8, size.height * 0.7)
+      ..lineTo(size.width * 0.2, size.height * 0.7)
       ..close();
 
     canvas.drawPath(path, pathPaint);
   }
 
   @override
-  bool shouldRepaint(
-    covariant CustomPainter oldDelegate,
-  ) {
+  bool shouldRepaint(covariant CustomPainter oldDelegate) {
     return false;
   }
 }
