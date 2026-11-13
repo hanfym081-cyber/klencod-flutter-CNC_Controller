@@ -1,23 +1,11 @@
 
-import 'dart:math' as math;
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:file_picker/file_picker.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const Mach3App());
-}
-
-const bg = Color(0xFF15191E);
-const panel = Color(0xFF222830);
-const panel2 = Color(0xFF2B333D);
-const accent = Color(0xFF00B8D4);
-const green = Color(0xFF19C784);
-const red = Color(0xFFE34B4B);
-const yellow = Color(0xFFFFC247);
-const muted = Color(0xFF9BA8B5);
+void main() => runApp(const Mach3App());
 
 class Mach3App extends StatelessWidget {
   const Mach3App({super.key});
@@ -26,1021 +14,1037 @@ class Mach3App extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Mach3 Mill',
+      title: 'Mach3 Mobile',
       theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: bg,
-        colorScheme: const ColorScheme.dark(
-          primary: accent,
-          surface: panel,
-        ),
         useMaterial3: true,
+        brightness: Brightness.dark,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.cyan,
+          brightness: Brightness.dark,
+        ),
+        scaffoldBackgroundColor: const Color(0xFF101820),
       ),
-      home: const Mach3Home(),
+      home: const HomePage(),
     );
   }
 }
 
-enum Motion { rapid, linear, clockwise, counterClockwise }
+// =====================================================
+// TCP CLIENT - MACH3 BRIDGE PROTOCOL 1.0
+// =====================================================
 
-class GCodeState {
-  double x = 0, y = 0, z = 0;
-  double feed = 100;
-  double spindle = 0;
-  bool metric = true;
-  bool absolute = true;
-  bool spindleOn = false;
-  bool spindleReverse = false;
-  int offset = 54;
-  Motion motion = Motion.rapid;
+class BridgeClient extends ChangeNotifier {
+  Socket? socket;
+  StreamSubscription<String>? subscription;
 
-  GCodeState copy() {
-    final s = GCodeState();
-    s.x = x;
-    s.y = y;
-    s.z = z;
-    s.feed = feed;
-    s.spindle = spindle;
-    s.metric = metric;
-    s.absolute = absolute;
-    s.spindleOn = spindleOn;
-    s.spindleReverse = spindleReverse;
-    s.offset = offset;
-    s.motion = motion;
-    return s;
+  final Map<int, Completer<Map<String, dynamic>>> pending = {};
+
+  int nextId = 1;
+  bool connected = false;
+  bool connecting = false;
+
+  String host = '192.168.137.1';
+  int port = 5000;
+
+  String status = 'غير متصل';
+  String? error;
+
+  Map<String, dynamic> machine = {};
+
+  Future<void> connect(String ip, int tcpPort) async {
+    await disconnect();
+
+    host = ip.trim();
+    port = tcpPort;
+
+    connecting = true;
+    status = 'جاري الاتصال';
+    error = null;
+    notifyListeners();
+
+    try {
+      socket = await Socket.connect(
+        host,
+        port,
+        timeout: const Duration(seconds: 5),
+      );
+
+      connected = true;
+      connecting = false;
+      status = 'متصل';
+
+      subscription = socket!
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen(
+        receiveMessage,
+        onDone: () => connectionLost('انقطع الاتصال'),
+        onError: (e) => connectionLost(e.toString()),
+      );
+
+      notifyListeners();
+
+      await command('hello', {
+        'client': 'Mach3 Mobile',
+        'protocol': '1.0',
+      });
+
+      await command('get_status');
+    } catch (e) {
+      connected = false;
+      connecting = false;
+      status = 'فشل الاتصال';
+      error = e.toString();
+      notifyListeners();
+    }
   }
-}
 
-class GCodeBlock {
-  final int line;
-  final String source;
-  final GCodeState state;
-  final bool supported;
-  final String message;
+  void receiveMessage(String line) {
+    try {
+      final msg = jsonDecode(line) as Map<String, dynamic>;
 
-  GCodeBlock({
-    required this.line,
-    required this.source,
-    required this.state,
-    required this.supported,
-    required this.message,
-  });
-}
-
-class GCodeParser {
-  final List<GCodeBlock> blocks = [];
-  final List<String> errors = [];
-
-  GCodeState parse(String source) {
-    blocks.clear();
-    errors.clear();
-
-    final state = GCodeState();
-    final lines = source.split('\n');
-
-    for (int i = 0; i < lines.length; i++) {
-      final original = lines[i];
-      final clean = original
-          .replaceAll(RegExp(r'\([^)]*\)'), '')
-          .split(';')
-          .first
-          .toUpperCase();
-
-      if (clean.trim().isEmpty) continue;
-
-      final words = RegExp(
-        r'([A-Z])\s*(-?(?:\d+\.?\d*|\.\d+))',
-      ).allMatches(clean).map((m) {
-        return MapEntry(
-          m.group(1)!,
-          double.parse(m.group(2)!),
-        );
-      }).toList();
-
-      final before = state.copy();
-      bool supported = true;
-      final notes = <String>[];
-
-      // Modal G-codes
-      for (final word in words) {
-        if (word.key != 'G') continue;
-        final g = word.value;
-
-        if (g == 0) state.motion = Motion.rapid;
-        else if (g == 1) state.motion = Motion.linear;
-        else if (g == 2) state.motion = Motion.clockwise;
-        else if (g == 3) state.motion = Motion.counterClockwise;
-        else if (g == 17) {}
-        else if (g == 20) state.metric = false;
-        else if (g == 21) state.metric = true;
-        else if (g == 90) state.absolute = true;
-        else if (g == 91) state.absolute = false;
-        else if (g >= 54 && g <= 59) {
-          state.offset = g.toInt();
-        } else if (g == 4) {
-          notes.add('Dwell');
-        } else {
-          supported = false;
-          notes.add('G${g} غير مدعوم');
+      if (msg['type'] == 'event') {
+        if (msg['name'] == 'status_update' &&
+            msg['data'] is Map) {
+          machine = Map<String, dynamic>.from(msg['data']);
         }
+
+        notifyListeners();
+        return;
       }
 
-      double scale(double value) =>
-          state.metric ? value : value * 25.4;
+      final id = msg['id'];
 
-      double? value(String key) {
-        for (final w in words.reversed) {
-          if (w.key == key) return scale(w.value);
-        }
-        return null;
+      if (id is int && pending.containsKey(id)) {
+        pending.remove(id)!.complete(msg);
       }
 
-      for (final w in words) {
-        if (w.key == 'F') {
-          state.feed = scale(w.value);
-        } else if (w.key == 'S') {
-          state.spindle = w.value;
-        } else if (w.key == 'M') {
-          if (w.value == 3) {
-            state.spindleOn = true;
-            state.spindleReverse = false;
-          } else if (w.value == 4) {
-            state.spindleOn = true;
-            state.spindleReverse = true;
-          } else if (w.value == 5) {
-            state.spindleOn = false;
-          } else if (![0, 1, 2, 6, 30].contains(w.value.toInt())) {
-            supported = false;
-            notes.add('M${w.value} غير مدعوم');
-          }
-        }
+      if (msg['ok'] == false) {
+        error = msg['error']?['message']?.toString();
       }
 
-      final xv = value('X');
-      final yv = value('Y');
-      final zv = value('Z');
-
-      if (state.absolute) {
-        if (xv != null) state.x = xv;
-        if (yv != null) state.y = yv;
-        if (zv != null) state.z = zv;
-      } else {
-        if (xv != null) state.x += xv;
-        if (yv != null) state.y += yv;
-        if (zv != null) state.z += zv;
+      if (msg['data'] is Map) {
+        machine = Map<String, dynamic>.from(msg['data']);
       }
 
-      if (words.any((w) => w.key == 'I' || w.key == 'J')) {
-        if (state.motion != Motion.clockwise &&
-            state.motion != Motion.counterClockwise) {
-          notes.add('I/J بدون حركة قوسية');
-        }
-      }
+      notifyListeners();
+    } catch (e) {
+      error = 'رسالة غير مفهومة: $e';
+      notifyListeners();
+    }
+  }
 
-      final changed = xv != null || yv != null || zv != null;
-      if (changed && state.motion == Motion.rapid) {
-        notes.add('G0');
-      } else if (changed && state.motion == Motion.linear) {
-        notes.add('G1');
-      } else if (changed) {
-        notes.add('Arc');
-      }
-
-      blocks.add(GCodeBlock(
-        line: i + 1,
-        source: original,
-        state: state.copy(),
-        supported: supported,
-        message: notes.join(' | '),
-      ));
-
-      if (!supported) errors.add('Line ${i + 1}: ${notes.join(', ')}');
+  Future<Map<String, dynamic>> command(
+    String name, [
+    Map<String, dynamic> params = const {},
+  ]) async {
+    if (!connected || socket == null) {
+      return {
+        'ok': false,
+        'error': {'message': 'لا يوجد اتصال بالكمبيوتر'}
+      };
     }
 
-    return state;
+    final id = nextId++;
+    final completer = Completer<Map<String, dynamic>>();
+
+    pending[id] = completer;
+
+    final packet = {
+      'version': '1.0',
+      'id': id,
+      'type': 'command',
+      'name': name,
+      'params': params,
+    };
+
+    try {
+      socket!.write('${jsonEncode(packet)}\n');
+
+      return await completer.future.timeout(
+        const Duration(seconds: 4),
+        onTimeout: () {
+          pending.remove(id);
+          return {
+            'ok': false,
+            'error': {'message': 'انتهت مهلة الرد'}
+          };
+        },
+      );
+    } catch (e) {
+      pending.remove(id);
+      return {
+        'ok': false,
+        'error': {'message': e.toString()}
+      };
+    }
+  }
+
+  void connectionLost(String reason) {
+    connected = false;
+    connecting = false;
+    status = 'انقطع الاتصال';
+    error = reason;
+    socket = null;
+
+    for (final c in pending.values) {
+      if (!c.isCompleted) {
+        c.complete({
+          'ok': false,
+          'error': {'message': reason}
+        });
+      }
+    }
+
+    pending.clear();
+    notifyListeners();
+  }
+
+  Future<void> disconnect() async {
+    await subscription?.cancel();
+    subscription = null;
+
+    socket?.destroy();
+    socket = null;
+
+    connected = false;
+    connecting = false;
+    status = 'غير متصل';
+
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    disconnect();
+    super.dispose();
   }
 }
 
-class Mach3Home extends StatefulWidget {
-  const Mach3Home({super.key});
+// =====================================================
+// MAIN PAGE
+// =====================================================
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
 
   @override
-  State<Mach3Home> createState() => _Mach3HomeState();
+  State<HomePage> createState() => _HomePageState();
 }
 
-class _Mach3HomeState extends State<Mach3Home> {
-  int tab = 0;
+class _HomePageState extends State<HomePage> {
+  final bridge = BridgeClient();
 
-  double mx = 0, my = 0, mz = 0;
-  double wx = 0, wy = 0, wz = 0;
+  int selected = 0;
 
-  double feedOverride = 100;
-  double spindleOverride = 100;
-  double jogStep = 1;
-  double jogSpeed = 100;
+  final titles = [
+    'الرئيسية',
+    'تشغيل البرنامج',
+    'MDI',
+    'تحريك المحاور',
+    'Toolpath',
+    'الإزاحات',
+    'جدول الأدوات',
+    'التشخيص',
+    'الإعدادات',
+  ];
 
-  double spindleRpm = 0;
-  bool spindleOn = false;
-  bool spindleReverse = false;
-
-  bool running = false;
-  bool paused = false;
-  bool estop = false;
-
-  int currentLine = 0;
-  int selectedOffset = 54;
-
-  String program = '';
-  String fileName = 'No file loaded';
-  String ip = '192.168.1.100';
-  String port = '8080';
-
-  final parser = GCodeParser();
-  List<GCodeBlock> blocks = [];
-  final Map<int, List<double>> offsets = {
-    54: [0, 0, 0],
-    55: [0, 0, 0],
-    56: [0, 0, 0],
-    57: [0, 0, 0],
-    58: [0, 0, 0],
-    59: [0, 0, 0],
-  };
+  final icons = [
+    Icons.dashboard,
+    Icons.play_circle,
+    Icons.terminal,
+    Icons.open_with,
+    Icons.route,
+    Icons.tune,
+    Icons.construction,
+    Icons.monitor_heart,
+    Icons.settings,
+  ];
 
   @override
   void initState() {
     super.initState();
-    loadSettings();
+    bridge.addListener(refresh);
   }
 
-  Future<void> loadSettings() async {
-    final p = await SharedPreferences.getInstance();
-    setState(() {
-      ip = p.getString('ip') ?? ip;
-      port = p.getString('port') ?? port;
-      jogStep = p.getDouble('step') ?? jogStep;
-      jogSpeed = p.getDouble('jogSpeed') ?? jogSpeed;
-    });
+  void refresh() {
+    if (mounted) setState(() {});
   }
 
-  Future<void> saveSettings() async {
-    final p = await SharedPreferences.getInstance();
-    await p.setString('ip', ip);
-    await p.setString('port', port);
-    await p.setDouble('step', jogStep);
-    await p.setDouble('jogSpeed', jogSpeed);
-  }
-
-  double get workX => mx - offsets[selectedOffset]![0];
-  double get workY => my - offsets[selectedOffset]![1];
-  double get workZ => mz - offsets[selectedOffset]![2];
-
-  void zeroAxis(String axis) {
-    final o = offsets[selectedOffset]!;
-    if (axis == 'X' || axis == 'ALL') o[0] = mx;
-    if (axis == 'Y' || axis == 'ALL') o[1] = my;
-    if (axis == 'Z' || axis == 'ALL') o[2] = mz;
-    setState(() {});
-  }
-
-  void jog(String axis, double direction) {
-    if (estop || running) return;
-    final amount = jogStep * direction;
-
-    setState(() {
-      if (axis == 'X') mx += amount;
-      if (axis == 'Y') my += amount;
-      if (axis == 'Z') mz += amount;
-    });
-  }
-
-  Future<void> openFile() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['nc', 'tap', 'gcode', 'txt', 'ngc'],
-      withData: true,
-    );
-
-    if (result == null || result.files.single.bytes == null) return;
-
-    final file = result.files.single;
-    final content = String.fromCharCodes(file.bytes!);
-
-    setState(() {
-      fileName = file.name;
-      program = content;
-      blocks = parser.parse(program).blocks;
-      currentLine = 0;
-      running = false;
-      paused = false;
-    });
-  }
-
-  void startProgram() {
-    if (estop || blocks.isEmpty) return;
-    if (currentLine >= blocks.length) currentLine = 0;
-
-    setState(() {
-      running = true;
-      paused = false;
-    });
-
-    executeNext();
-  }
-
-  Future<void> executeNext() async {
-    while (running && !paused && !estop &&
-        currentLine < blocks.length) {
-      final block = blocks[currentLine];
-
-      await Future.delayed(const Duration(milliseconds: 250));
-
-      if (!mounted || !running || paused || estop) return;
-
-      setState(() {
-        mx = block.state.x;
-        my = block.state.y;
-        mz = block.state.z;
-        spindleRpm = block.state.spindle;
-        spindleOn = block.state.spindleOn;
-        spindleReverse = block.state.spindleReverse;
-        currentLine++;
-      });
-    }
-
-    if (mounted && currentLine >= blocks.length) {
-      setState(() {
-        running = false;
-        paused = false;
-      });
-    }
-  }
-
-  void holdProgram() {
-    setState(() {
-      paused = true;
-      running = false;
-    });
-  }
-
-  void stopProgram() {
-    setState(() {
-      running = false;
-      paused = false;
-      currentLine = 0;
-      spindleOn = false;
-    });
-  }
-
-  void emergencyStop() {
-    setState(() {
-      estop = true;
-      running = false;
-      paused = false;
-      spindleOn = false;
-    });
-  }
-
-  void resetEmergency() {
-    setState(() => estop = false);
-  }
-
-  Widget numberBox(String label, double value,
-      {Color color = Colors.white}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 7),
-      decoration: BoxDecoration(
-        color: Colors.black,
-        border: Border.all(color: panel2),
-        borderRadius: BorderRadius.circular(5),
-      ),
-      child: Column(
-        children: [
-          Text(label, style: const TextStyle(color: muted, fontSize: 12)),
-          const SizedBox(height: 4),
-          FittedBox(
-            child: Text(
-              value.toStringAsFixed(3),
-              style: TextStyle(
-                color: color,
-                fontSize: 23,
-                fontWeight: FontWeight.bold,
-                fontFamily: 'monospace',
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget coordinates() {
-    return Row(
-      children: [
-        Expanded(child: numberBox('X', workX, color: Colors.redAccent)),
-        const SizedBox(width: 5),
-        Expanded(child: numberBox('Y', workY, color: green)),
-        const SizedBox(width: 5),
-        Expanded(child: numberBox('Z', workZ, color: accent)),
-      ],
-    );
-  }
-
-  Widget machineCoordinates() {
-    return Row(
-      children: [
-        Expanded(child: numberBox('MACHINE X', mx)),
-        const SizedBox(width: 5),
-        Expanded(child: numberBox('MACHINE Y', my)),
-        const SizedBox(width: 5),
-        Expanded(child: numberBox('MACHINE Z', mz)),
-      ],
-    );
-  }
-
-  Widget section(String title, Widget child) {
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: panel,
-        borderRadius: BorderRadius.circular(7),
-        border: Border.all(color: panel2),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title,
-              style: const TextStyle(
-                  color: accent, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 10),
-          child,
-        ],
-      ),
-    );
-  }
-
-  Widget actionButton(
-    String label,
-    VoidCallback action, {
-    Color color = panel2,
-    double height = 45,
-  }) {
-    return SizedBox(
-      height: height,
-      child: ElevatedButton(
-        style: ElevatedButton.styleFrom(
-          backgroundColor: color,
-          foregroundColor: Colors.white,
-          padding: const EdgeInsets.symmetric(horizontal: 8),
-          shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(5)),
-        ),
-        onPressed: action,
-        child: FittedBox(
-          child: Text(label,
-              style: const TextStyle(fontWeight: FontWeight.bold)),
-        ),
-      ),
-    );
-  }
-
-  Widget sliderControl(
-      String label, double value, double min, double max,
-      ValueChanged<double> change) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(label),
-            Text('${value.toStringAsFixed(0)}%',
-                style: const TextStyle(color: accent)),
-          ],
-        ),
-        Slider(
-          value: value.clamp(min, max),
-          min: min,
-          max: max,
-          onChanged: (v) => setState(() => change(v)),
-        ),
-      ],
-    );
-  }
-
-  Widget programScreen() {
-    return ListView(
-      padding: const EdgeInsets.all(10),
-      children: [
-        section('WORK COORDINATES', coordinates()),
-        section('MACHINE COORDINATES', machineCoordinates()),
-        section('TOOLPATH PREVIEW', SizedBox(
-          height: 180,
-          child: CustomPaint(
-            painter: ToolpathPainter(blocks, currentLine),
-            child: const Center(
-              child: Text('XY TOOLPATH',
-                  style: TextStyle(color: muted, fontSize: 10)),
-            ),
-          ),
-        )),
-        section('PROGRAM CONTROL',
-          Column(children: [
-            Row(children: [
-              Expanded(child: actionButton(
-                  'CYCLE START', startProgram, color: green)),
-              const SizedBox(width: 6),
-              Expanded(child: actionButton(
-                  'FEED HOLD', holdProgram, color: yellow)),
-              const SizedBox(width: 6),
-              Expanded(child: actionButton(
-                  'STOP', stopProgram, color: red)),
-            ]),
-            const SizedBox(height: 8),
-            Text('FILE: $fileName',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis),
-            Text('LINE: $currentLine / ${blocks.length}'),
-            Text(running ? 'RUNNING' :
-                paused ? 'PAUSED' : 'IDLE',
-                style: TextStyle(
-                    color: running ? green : yellow,
-                    fontWeight: FontWeight.bold)),
-          ]),
-        ),
-        section('FEED RATE OVERRIDE',
-            sliderControl('FEED', feedOverride, 0, 150,
-                (v) => feedOverride = v)),
-        section('SPINDLE',
-          Column(children: [
-            Text('${spindleRpm.toStringAsFixed(0)} RPM',
-                style: const TextStyle(fontSize: 25)),
-            Row(children: [
-              Expanded(child: actionButton('SPINDLE CW', () {
-                setState(() {
-                  spindleOn = true;
-                  spindleReverse = false;
-                });
-              }, color: green)),
-              const SizedBox(width: 6),
-              Expanded(child: actionButton('SPINDLE CCW', () {
-                setState(() {
-                  spindleOn = true;
-                  spindleReverse = true;
-                });
-              }, color: accent)),
-              const SizedBox(width: 6),
-              Expanded(child: actionButton('SPINDLE STOP', () {
-                setState(() => spindleOn = false);
-              }, color: red)),
-            ]),
-            sliderControl('SPINDLE OVERRIDE', spindleOverride,
-                0, 150, (v) => spindleOverride = v),
-            Text(spindleOn
-                ? (spindleReverse ? 'REVERSE' : 'FORWARD')
-                : 'STOPPED'),
-          ]),
-        ),
-        section('G-CODE PREVIEW', SizedBox(
-          height: 220,
-          child: ListView.builder(
-            itemCount: blocks.length,
-            itemBuilder: (context, index) {
-              final b = blocks[index];
-              return Container(
-                color: index + 1 == currentLine
-                    ? Colors.blueGrey.withOpacity(.5)
-                    : Colors.transparent,
-                padding: const EdgeInsets.symmetric(vertical: 3),
-                child: Text(
-                  '${b.line.toString().padLeft(3)}  ${b.source}',
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    color: b.supported ? Colors.white : red,
-                  ),
-                ),
-              );
-            },
-          ),
-        )),
-        if (parser.errors.isNotEmpty)
-          section('UNSUPPORTED COMMANDS',
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: parser.errors.map((e) =>
-                Text(e, style: const TextStyle(color: red))).toList(),
-            )),
-      ],
-    );
-  }
-
-  Widget jogButton(String label, String axis, double direction) {
-    return SizedBox(
-      width: 75,
-      height: 60,
-      child: ElevatedButton(
-        onPressed: () => setState(() => jog(axis, direction)),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: panel2,
-          foregroundColor: Colors.white,
-        ),
-        child: Text(label,
-            style: const TextStyle(
-                fontSize: 20, fontWeight: FontWeight.bold)),
-      ),
-    );
-  }
-
-  Widget jogScreen() {
-    return ListView(
-      padding: const EdgeInsets.all(10),
-      children: [
-        section('WORK COORDINATES', coordinates()),
-        section('MACHINE COORDINATES', machineCoordinates()),
-        section('XY JOG',
-          Column(children: [
-            jogButton('Y+', 'Y', 1),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                jogButton('X-', 'X', -1),
-                const SizedBox(width: 20),
-                jogButton('X+', 'X', 1),
-              ],
-            ),
-            jogButton('Y-', 'Y', -1),
-          ]),
-        ),
-        section('Z JOG',
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              jogButton('Z+', 'Z', 1),
-              const SizedBox(width: 15),
-              jogButton('Z-', 'Z', -1),
-            ],
-          ),
-        ),
-        section('JOG SETTINGS',
-          Column(children: [
-            const Text('JOG STEP'),
-            Wrap(
-              spacing: 6,
-              children: [0.001, 0.01, 0.1, 1, 10].map((v) =>
-                ChoiceChip(
-                  label: Text('$v'),
-                  selected: jogStep == v,
-                  onSelected: (_) => setState(() => jogStep = v),
-                )).toList(),
-            ),
-            const SizedBox(height: 8),
-            Text('JOG SPEED: ${jogSpeed.toStringAsFixed(0)}%'),
-            Slider(
-              value: jogSpeed,
-              min: 1,
-              max: 100,
-              onChanged: (v) => setState(() => jogSpeed = v),
-            ),
-          ]),
-        ),
-        section('ZERO WORK AXIS',
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: ['X', 'Y', 'Z', 'ALL'].map((axis) =>
-              SizedBox(
-                width: 75,
-                child: actionButton('ZERO $axis',
-                    () => setState(() => zeroAxis(axis)),
-                    color: accent),
-              )).toList(),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget offsetsScreen() {
-    return ListView(
-      padding: const EdgeInsets.all(10),
-      children: [
-        section('MACHINE POSITION', machineCoordinates()),
-        section('WORK POSITION', coordinates()),
-        section('WORK OFFSET SELECT',
-          Wrap(
-            spacing: 6,
-            children: [54, 55, 56, 57, 58, 59].map((n) =>
-              ChoiceChip(
-                label: Text('G$n'),
-                selected: selectedOffset == n,
-                onSelected: (_) => setState(() => selectedOffset = n),
-              )).toList(),
-          ),
-        ),
-        section('CURRENT OFFSET G$selectedOffset',
-          Column(children: [
-            numberBox('OFFSET X', offsets[selectedOffset]![0]),
-            const SizedBox(height: 5),
-            numberBox('OFFSET Y', offsets[selectedOffset]![1]),
-            const SizedBox(height: 5),
-            numberBox('OFFSET Z', offsets[selectedOffset]![2]),
-          ]),
-        ),
-        section('ZERO WORK COORDINATES',
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: ['X', 'Y', 'Z', 'ALL'].map((axis) =>
-              SizedBox(
-                width: 75,
-                child: actionButton('ZERO $axis',
-                    () => setState(() => zeroAxis(axis)),
-                    color: accent),
-              )).toList(),
-          ),
-        ),
-        section('TOOL ZERO',
-          actionButton('SET TOOL ZERO (Z)',
-              () => setState(() => zeroAxis('Z')),
-              color: yellow),
-        ),
-      ],
-    );
-  }
-
-  Widget filesScreen() {
-    return ListView(
-      padding: const EdgeInsets.all(10),
-      children: [
-        section('G-CODE FILE',
-          Column(children: [
-            Text(fileName,
-                style: const TextStyle(fontSize: 16)),
-            const SizedBox(height: 10),
-            actionButton('OPEN G-CODE FILE', openFile,
-                color: accent),
-            const SizedBox(height: 8),
-            actionButton('CLEAR PROGRAM', () {
-              setState(() {
-                program = '';
-                fileName = 'No file loaded';
-                blocks.clear();
-                currentLine = 0;
-              });
-            }, color: red),
-          ]),
-        ),
-        section('PROGRAM INFORMATION',
-          Column(crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Lines: ${blocks.length}'),
-              Text('Current line: $currentLine'),
-              Text('Unsupported commands: ${parser.errors.length}'),
-              const SizedBox(height: 10),
-              const Text('PROGRAM CONTENT',
-                  style: TextStyle(color: accent)),
-              Container(
-                height: 300,
-                width: double.infinity,
-                padding: const EdgeInsets.all(8),
-                color: Colors.black,
-                child: SingleChildScrollView(
-                  child: SelectableText(
-                    program.isEmpty ? 'No program loaded' : program,
-                    style: const TextStyle(
-                        fontFamily: 'monospace', fontSize: 12),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget connectionScreen() {
-    final ipController = TextEditingController(text: ip);
-    final portController = TextEditingController(text: port);
-
-    return ListView(
-      padding: const EdgeInsets.all(10),
-      children: [
-        section('MACH3 CONNECTION',
-          Column(children: [
-            TextField(
-              controller: ipController,
-              decoration: const InputDecoration(
-                labelText: 'Windows PC IP Address',
-              ),
-            ),
-            TextField(
-              controller: portController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'Port'),
-            ),
-            const SizedBox(height: 12),
-            actionButton('SAVE SETTINGS', () {
-              setState(() {
-                ip = ipController.text;
-                port = portController.text;
-              });
-              saveSettings();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Settings saved')),
-              );
-            }, color: accent),
-          ]),
-        ),
-        section('CONNECTION STATUS',
-          const Column(children: [
-            Icon(Icons.link_off, color: yellow, size: 38),
-            Text('NOT CONNECTED'),
-            Text('Windows communication service is not configured.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: muted)),
-          ]),
-        ),
-        section('SYSTEM INFORMATION',
-          const Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Controller: Android'),
-              Text('Target: Mach3 on Windows'),
-              Text('Protocol: WebSocket (planned)'),
-              Text('Connection: Not active'),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget screen() {
-    switch (tab) {
-      case 0: return programScreen();
-      case 1: return jogScreen();
-      case 2: return offsetsScreen();
-      case 3: return filesScreen();
-      default: return connectionScreen();
-    }
+  @override
+  void dispose() {
+    bridge.removeListener(refresh);
+    bridge.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: panel,
-        title: const Text('MACH3 MILL',
-            style: TextStyle(
-                fontWeight: FontWeight.bold, letterSpacing: 2)),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: Center(
-              child: Text(
-                estop ? 'ESTOP ACTIVE' : 'OFFLINE',
-                style: TextStyle(
-                  color: estop ? red : yellow,
-                  fontWeight: FontWeight.bold,
+    final pages = [
+      DashboardPage(bridge: bridge),
+      ProgramPage(bridge: bridge),
+      MdiPage(bridge: bridge),
+      JogPage(bridge: bridge),
+      ToolpathPage(bridge: bridge),
+      DataPage(bridge: bridge, title: 'الإزاحات', command: 'get_offsets'),
+      DataPage(bridge: bridge, title: 'جدول الأدوات', command: 'get_tools'),
+      DataPage(bridge: bridge, title: 'التشخيص', command: 'get_diagnostics'),
+      SettingsPage(bridge: bridge),
+    ];
+
+    return Directionality(
+      textDirection: TextDirection.rtl,
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(titles[selected]),
+          actions: [
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Chip(
+                avatar: Icon(
+                  bridge.connected ? Icons.wifi : Icons.wifi_off,
+                  color: bridge.connected
+                      ? Colors.greenAccent
+                      : Colors.orangeAccent,
                 ),
+                label: Text(bridge.status),
               ),
             ),
-          ),
-        ],
-      ),
-      body: Column(children: [
-        Expanded(child: screen()),
-        Container(
-          color: Colors.black,
-          padding: const EdgeInsets.all(6),
-          child: Row(children: [
-            Expanded(
-              child: SizedBox(
-                height: 52,
-                child: ElevatedButton(
-                  onPressed: estop ? resetEmergency : emergencyStop,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: estop ? green : red,
-                    foregroundColor: Colors.white,
-                  ),
-                  child: Text(estop ? 'RESET ESTOP' : 'EMERGENCY STOP',
-                      style: const TextStyle(
-                          fontWeight: FontWeight.bold)),
-                ),
-              ),
-            ),
-          ]),
+          ],
         ),
-      ]),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: tab,
-        onDestinationSelected: (i) => setState(() => tab = i),
-        backgroundColor: panel,
-        indicatorColor: accent.withOpacity(.2),
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.play_circle_outline),
-            label: 'PROGRAM',
+        drawer: Drawer(
+          child: SafeArea(
+            child: Column(
+              children: [
+                const ListTile(
+                  title: Text(
+                    'MACH3 MOBILE',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  subtitle: Text('CNC Wireless Controller'),
+                ),
+                const Divider(),
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: titles.length,
+                    itemBuilder: (context, i) => ListTile(
+                      leading: Icon(icons[i]),
+                      title: Text(titles[i]),
+                      selected: selected == i,
+                      onTap: () {
+                        setState(() => selected = i);
+                        Navigator.pop(context);
+                      },
+                    ),
+                  ),
+                ),
+                const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: Text(
+                    'زر الطوارئ يجب أن يظل مستقلًا وماديًا.',
+                    style: TextStyle(color: Colors.orangeAccent),
+                  ),
+                ),
+              ],
+            ),
           ),
-          NavigationDestination(
-            icon: Icon(Icons.gamepad),
-            label: 'JOG',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.tune),
-            label: 'OFFSETS',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.folder_open),
-            label: 'FILES',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.settings_ethernet),
-            label: 'CONNECT',
-          ),
-        ],
+        ),
+        body: SafeArea(child: pages[selected]),
       ),
     );
   }
 }
 
-class ToolpathPainter extends CustomPainter {
-  final List<GCodeBlock> blocks;
-  final int currentLine;
+// =====================================================
+// COMMON PANEL
+// =====================================================
 
-  ToolpathPainter(this.blocks, this.currentLine);
+class Panel extends StatelessWidget {
+  final String title;
+  final Widget child;
+
+  const Panel({
+    super.key,
+    required this.title,
+    required this.child,
+  });
 
   @override
-  void paint(Canvas canvas, Size size) {
-    final bgPaint = Paint()..color = Colors.black;
-    canvas.drawRect(Offset.zero & size, bgPaint);
-
-    final grid = Paint()
-      ..color = Colors.white12
-      ..strokeWidth = .5;
-
-    for (double x = 0; x < size.width; x += 20) {
-      canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
-    }
-    for (double y = 0; y < size.height; y += 20) {
-      canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
-    }
-
-    if (blocks.isEmpty) return;
-
-    final xs = blocks.map((b) => b.state.x);
-    final ys = blocks.map((b) => b.state.y);
-
-    final minX = xs.reduce(math.min);
-    final maxX = xs.reduce(math.max);
-    final minY = ys.reduce(math.min);
-    final maxY = ys.reduce(math.max);
-
-    final dx = (maxX - minX).abs() < .001 ? 1.0 : maxX - minX;
-    final dy = (maxY - minY).abs() < .001 ? 1.0 : maxY - minY;
-
-    Offset point(GCodeState s) => Offset(
-      12 + (s.x - minX) / dx * (size.width - 24),
-      size.height - 12 - (s.y - minY) / dy * (size.height - 24),
+  Widget build(BuildContext context) {
+    return Card(
+      color: const Color(0xFF1B2833),
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 12),
+            child,
+          ],
+        ),
+      ),
     );
+  }
+}
 
-    final path = Path();
-    bool first = true;
-    Offset previous = Offset.zero;
+// =====================================================
+// DASHBOARD
+// =====================================================
 
-    for (final block in blocks) {
-      final p = point(block.state);
-      if (first) {
-        path.moveTo(p.dx, p.dy);
-        first = false;
-      } else {
-        path.lineTo(p.dx, p.dy);
-      }
-      previous = p;
-    }
+class DashboardPage extends StatelessWidget {
+  final BridgeClient bridge;
 
-    canvas.drawPath(
-      path,
-      Paint()
-        ..color = accent
-        ..strokeWidth = 2
-        ..style = PaintingStyle.stroke,
+  const DashboardPage({super.key, required this.bridge});
+
+  @override
+  Widget build(BuildContext context) {
+    final axes = bridge.machine['axes'] is Map
+        ? bridge.machine['axes'] as Map
+        : {};
+
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Panel(
+          title: 'الاتصال',
+          child: Row(
+            children: [
+              Icon(
+                bridge.connected ? Icons.check_circle : Icons.cancel,
+                color: bridge.connected
+                    ? Colors.greenAccent
+                    : Colors.orangeAccent,
+              ),
+              const SizedBox(width: 10),
+              Text(bridge.status),
+            ],
+          ),
+        ),
+        Panel(
+          title: 'مواضع المحاور',
+          child: Row(
+            children: ['x', 'y', 'z'].map((axis) {
+              return Expanded(
+                child: Column(
+                  children: [
+                    Text(
+                      axis.toUpperCase(),
+                      style: const TextStyle(
+                        color: Colors.cyanAccent,
+                        fontSize: 22,
+                      ),
+                    ),
+                    Text(
+                      '${axes[axis] ?? '--'}',
+                      style: const TextStyle(fontSize: 19),
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+        Panel(
+          title: 'حالة الماكينة',
+          child: Wrap(
+            spacing: 8,
+            children: [
+              Chip(
+                label: Text(
+                  'الحركة: ${bridge.machine['machine_state'] ?? '--'}',
+                ),
+              ),
+              Chip(
+                label: Text(
+                  'Feed: ${bridge.machine['feed_rate'] ?? '--'}',
+                ),
+              ),
+              Chip(
+                label: Text(
+                  'Spindle: ${bridge.machine['spindle_speed'] ?? '--'}',
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (bridge.error != null)
+          Panel(
+            title: 'آخر خطأ',
+            child: Text(
+              bridge.error!,
+              style: const TextStyle(color: Colors.orangeAccent),
+            ),
+          ),
+      ],
     );
+  }
+}
 
-    if (currentLine > 0 && currentLine <= blocks.length) {
-      final p = point(blocks[currentLine - 1].state);
-      canvas.drawCircle(
-        p,
-        5,
-        Paint()..color = yellow,
+// =====================================================
+// PROGRAM RUN
+// =====================================================
+
+class ProgramPage extends StatelessWidget {
+  final BridgeClient bridge;
+
+  const ProgramPage({super.key, required this.bridge});
+
+  Future<void> send(BuildContext context, String command) async {
+    final result = await bridge.command(command);
+
+    if (context.mounted && result['ok'] != true) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result['error']?['message'] ?? 'تعذر تنفيذ الأمر',
+          ),
+        ),
       );
     }
   }
 
   @override
-  bool shouldRepaint(covariant ToolpathPainter oldDelegate) =>
-      oldDelegate.blocks != blocks ||
-      oldDelegate.currentLine != currentLine;
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Panel(
+          title: 'التحكم في البرنامج',
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.icon(
+                onPressed: () => send(context, 'run_program'),
+                icon: const Icon(Icons.play_arrow),
+                label: const Text('تشغيل'),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => send(context, 'feed_hold'),
+                icon: const Icon(Icons.pause),
+                label: const Text('إيقاف مؤقت'),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => send(context, 'resume'),
+                icon: const Icon(Icons.replay),
+                label: const Text('استكمال'),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: () => send(context, 'stop_program'),
+                icon: const Icon(Icons.stop),
+                label: const Text('إيقاف'),
+              ),
+            ],
+          ),
+        ),
+        Panel(
+          title: 'البرنامج الحالي',
+          child: Text(
+            '${bridge.machine['program_name'] ?? '--'}',
+          ),
+        ),
+        Panel(
+          title: 'سطر التنفيذ',
+          child: Text(
+            '${bridge.machine['current_line'] ?? '--'}',
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// =====================================================
+// MDI
+// =====================================================
+
+class MdiPage extends StatefulWidget {
+  final BridgeClient bridge;
+
+  const MdiPage({super.key, required this.bridge});
+
+  @override
+  State<MdiPage> createState() => _MdiPageState();
+}
+
+class _MdiPageState extends State<MdiPage> {
+  final controller = TextEditingController();
+  String result = 'جاهز';
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Panel(
+          title: 'إدخال G-code',
+          child: Column(
+            children: [
+              TextField(
+                controller: controller,
+                textDirection: TextDirection.ltr,
+                decoration: const InputDecoration(
+                  hintText: 'G0 X0 Y0',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              FilledButton(
+                onPressed: () async {
+                  final code = controller.text.trim();
+                  if (code.isEmpty) return;
+
+                  final response = await widget.bridge.command(
+                    'execute_mdi',
+                    {'code': code},
+                  );
+
+                  setState(() {
+                    result = response['ok'] == true
+                        ? 'تم قبول الرد'
+                        : response['error']?['message'] ?? 'فشل الأمر';
+                  });
+                },
+                child: const Text('إرسال الأمر'),
+              ),
+              const SizedBox(height: 10),
+              Text(result),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// =====================================================
+// JOG
+// =====================================================
+
+class JogPage extends StatefulWidget {
+  final BridgeClient bridge;
+
+  const JogPage({super.key, required this.bridge});
+
+  @override
+  State<JogPage> createState() => _JogPageState();
+}
+
+class _JogPageState extends State<JogPage> {
+  double speed = 20;
+  double step = 1;
+  Timer? heartbeat;
+  bool jogging = false;
+
+  Future<void> startJog(String axis, int direction) async {
+    if (jogging) return;
+    jogging = true;
+
+    await widget.bridge.command('jog_start', {
+      'axis': axis,
+      'direction': direction,
+      'mode': 'continuous',
+      'speed_percent': speed,
+      'lease_ms': 400,
+    });
+
+    heartbeat?.cancel();
+    heartbeat = Timer.periodic(
+      const Duration(milliseconds: 150),
+      (_) {
+        widget.bridge.command('jog_start', {
+          'axis': axis,
+          'direction': direction,
+          'mode': 'continuous',
+          'speed_percent': speed,
+          'lease_ms': 400,
+        });
+      },
+    );
+  }
+
+  Future<void> stopJog() async {
+    heartbeat?.cancel();
+    heartbeat = null;
+    jogging = false;
+    await widget.bridge.command('jog_stop', {'axis': 'all'});
+  }
+
+  @override
+  void dispose() {
+    heartbeat?.cancel();
+    if (jogging) widget.bridge.command('jog_stop', {'axis': 'all'});
+    super.dispose();
+  }
+
+  Widget holdButton(String label, String axis, int direction) {
+    return GestureDetector(
+      onLongPressStart: (_) => startJog(axis, direction),
+      onLongPressEnd: (_) => stopJog(),
+      child: Container(
+        height: 58,
+        decoration: BoxDecoration(
+          color: Colors.blueGrey.shade800,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Center(
+          child: Text(
+            label,
+            style: const TextStyle(fontSize: 26),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget axisRow(String axis) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 30,
+            child: Text(
+              axis.toUpperCase(),
+              style: const TextStyle(fontSize: 20),
+            ),
+          ),
+          Expanded(child: holdButton('−', axis, -1)),
+          const SizedBox(width: 10),
+          Expanded(child: holdButton('+', axis, 1)),
+          IconButton(
+            onPressed: () {
+              widget.bridge.command('jog_step', {
+                'axis': axis,
+                'direction': 1,
+                'distance': step,
+              });
+            },
+            icon: const Icon(Icons.straighten),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Panel(
+          title: 'سرعة التحريك',
+          child: Slider(
+            value: speed,
+            min: 1,
+            max: 100,
+            divisions: 99,
+            label: '${speed.round()}%',
+            onChanged: (v) => setState(() => speed = v),
+          ),
+        ),
+        Panel(
+          title: 'خطوة التحريك',
+          child: DropdownButton<double>(
+            value: step,
+            isExpanded: true,
+            items: [0.001, 0.01, 0.1, 1, 10]
+                .map(
+                  (v) => DropdownMenuItem(
+                    value: v,
+                    child: Text('$v'),
+                  ),
+                )
+                .toList(),
+            onChanged: (v) => setState(() => step = v ?? step),
+          ),
+        ),
+        Panel(
+          title: 'تحريك المحاور',
+          child: Column(
+            children: [
+              axisRow('x'),
+              axisRow('y'),
+              axisRow('z'),
+              FilledButton.tonal(
+                onPressed: stopJog,
+                child: const Text('إيقاف التحريك'),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// =====================================================
+// TOOLPATH
+// =====================================================
+
+class ToolpathPage extends StatelessWidget {
+  final BridgeClient bridge;
+
+  const ToolpathPage({super.key, required this.bridge});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Panel(
+          title: 'معاينة مسار الأداة',
+          child: AspectRatio(
+            aspectRatio: 1,
+            child: CustomPaint(
+              painter: GridPainter(),
+              child: Center(
+                child: Text(
+                  bridge.machine['toolpath_available'] == true
+                      ? 'بيانات المسار متاحة'
+                      : 'بانتظار بيانات المسار',
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class GridPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final grid = Paint()
+      ..color = Colors.blueGrey.withOpacity(0.4)
+      ..strokeWidth = 1;
+
+    for (double x = 0; x < size.width; x += 24) {
+      canvas.drawLine(
+        Offset(x, 0),
+        Offset(x, size.height),
+        grid,
+      );
+    }
+
+    for (double y = 0; y < size.height; y += 24) {
+      canvas.drawLine(
+        Offset(0, y),
+        Offset(size.width, y),
+        grid,
+      );
+    }
+
+    final center = Paint()
+      ..color = Colors.cyanAccent
+      ..strokeWidth = 2;
+
+    canvas.drawLine(
+      Offset(size.width / 2, 0),
+      Offset(size.width / 2, size.height),
+      center,
+    );
+
+    canvas.drawLine(
+      Offset(0, size.height / 2),
+      Offset(size.width, size.height / 2),
+      center,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+// =====================================================
+// DATA PAGES
+// =====================================================
+
+class DataPage extends StatefulWidget {
+  final BridgeClient bridge;
+  final String title;
+  final String command;
+
+  const DataPage({
+    super.key,
+    required this.bridge,
+    required this.title,
+    required this.command,
+  });
+
+  @override
+  State<DataPage> createState() => _DataPageState();
+}
+
+class _DataPageState extends State<DataPage> {
+  Map<String, dynamic>? data;
+  String message = 'اضغط تحديث';
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Panel(
+          title: widget.title,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              FilledButton.icon(
+                onPressed: () async {
+                  final response = await widget.bridge.command(
+                    widget.command,
+                  );
+
+                  setState(() {
+                    data = response['data'] is Map
+                        ? Map<String, dynamic>.from(response['data'])
+                        : null;
+
+                    message = response['ok'] == true
+                        ? 'تم استلام البيانات'
+                        : response['error']?['message'] ?? 'فشل القراءة';
+                  });
+                },
+                icon: const Icon(Icons.refresh),
+                label: const Text('تحديث'),
+              ),
+              const SizedBox(height: 12),
+              Text(message),
+              if (data != null)
+                SelectableText(
+                  const JsonEncoder.withIndent('  ').convert(data),
+                  textDirection: TextDirection.ltr,
+                ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// =====================================================
+// SETTINGS AND CONNECTION
+// =====================================================
+
+class SettingsPage extends StatefulWidget {
+  final BridgeClient bridge;
+
+  const SettingsPage({super.key, required this.bridge});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  final ip = TextEditingController(text: '192.168.137.1');
+  final port = TextEditingController(text: '5000');
+
+  @override
+  void dispose() {
+    ip.dispose();
+    port.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        Panel(
+          title: 'اتصال الكمبيوتر',
+          child: Column(
+            children: [
+              TextField(
+                controller: ip,
+                textDirection: TextDirection.ltr,
+                decoration: const InputDecoration(
+                  labelText: 'IP Address',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: port,
+                keyboardType: TextInputType.number,
+                textDirection: TextDirection.ltr,
+                decoration: const InputDecoration(
+                  labelText: 'TCP Port',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton(
+                      onPressed: widget.bridge.connecting
+                          ? null
+                          : () => widget.bridge.connect(
+                                ip.text,
+                                int.tryParse(port.text) ?? 5000,
+                              ),
+                      child: const Text('اتصال'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: widget.bridge.disconnect,
+                      child: const Text('فصل الاتصال'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(widget.bridge.status),
+              if (widget.bridge.error != null)
+                Text(
+                  widget.bridge.error!,
+                  style: const TextStyle(color: Colors.orangeAccent),
+                ),
+            ],
+          ),
+        ),
+        const Panel(
+          title: 'البروتوكول',
+          child: Text(
+            'Mach3 Mobile Bridge 1.0\n'
+            'TCP/IP\n'
+            'JSON Lines\n'
+            'UTF-8\n'
+            'Port 5000',
+          ),
+        ),
+        const Panel(
+          title: 'تنبيه أمان',
+          child: Text(
+            'التطبيق ليس بديلًا عن زر الطوارئ المادي. '
+            'لا تختبر أوامر الحركة قبل تجهيز Windows Bridge '
+            'والتحقق من حدود الحركة ووسائل الأمان.',
+          ),
+        ),
+      ],
+    );
+  }
 }
