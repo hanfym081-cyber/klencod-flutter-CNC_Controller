@@ -60,9 +60,18 @@ class _MainScreenState extends State<MainScreen> {
   double x = 0;
   double y = 0;
   double z = 0;
+
   double feed = 100;
   double rpm = 0;
   double spindleOverride = 100;
+
+  final List<String> pageTitles = [
+    'PROGRAM RUN',
+    'JOG / SPEED',
+    'WORK OFFSETS',
+    'FILES',
+    'CONNECTION',
+  ];
 
   @override
   void initState() {
@@ -72,6 +81,7 @@ class _MainScreenState extends State<MainScreen> {
 
   Future<void> loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
+
     if (!mounted) return;
 
     setState(() {
@@ -80,8 +90,12 @@ class _MainScreenState extends State<MainScreen> {
     });
   }
 
-  Future<void> saveSettings(String newIp, String newPort) async {
+  Future<void> saveSettings(
+    String newIp,
+    String newPort,
+  ) async {
     final prefs = await SharedPreferences.getInstance();
+
     await prefs.setString('ip', newIp);
     await prefs.setString('port', newPort);
 
@@ -96,14 +110,19 @@ class _MainScreenState extends State<MainScreen> {
   void notify(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(message, textAlign: TextAlign.center),
+        content: Text(
+          message,
+          textAlign: TextAlign.center,
+        ),
         duration: const Duration(seconds: 2),
       ),
     );
   }
 
   void unavailable(String command) {
-    notify('$command: سيتم تفعيله بعد تجهيز برنامج Windows');
+    notify(
+      '$command: سيتم تفعيله بعد تجهيز برنامج Windows',
+    );
   }
 
   Future<void> showSettings() async {
@@ -138,7 +157,9 @@ class _MainScreenState extends State<MainScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
+            onPressed: () {
+              Navigator.pop(dialogContext);
+            },
             child: const Text('إلغاء'),
           ),
           ElevatedButton(
@@ -177,11 +198,19 @@ class _MainScreenState extends State<MainScreen> {
     try {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
-        allowedExtensions: ['nc', 'tap', 'gcode', 'txt', 'cnc'],
+        allowedExtensions: [
+          'nc',
+          'tap',
+          'gcode',
+          'txt',
+          'cnc',
+        ],
         withData: true,
       );
 
-      if (result == null || result.files.isEmpty) return;
+      if (result == null || result.files.isEmpty) {
+        return;
+      }
 
       final selected = result.files.first;
 
@@ -191,7 +220,9 @@ class _MainScreenState extends State<MainScreen> {
             'الحجم: ${(selected.size / 1024).toStringAsFixed(1)} KB';
       });
 
-      notify('تم اختيار الملف. إرساله للكمبيوتر سيتم تفعيله لاحقاً');
+      notify(
+        'تم اختيار الملف. إرساله للكمبيوتر سيتم تفعيله لاحقاً',
+      );
     } catch (e) {
       notify('تعذر فتح الملف');
     }
@@ -221,7 +252,9 @@ class _MainScreenState extends State<MainScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
+            onPressed: () {
+              Navigator.pop(dialogContext);
+            },
             child: const Text('إغلاق'),
           ),
         ],
@@ -270,11 +303,16 @@ class _MainScreenState extends State<MainScreen> {
       height: 48,
       child: ElevatedButton.icon(
         onPressed: action,
-        icon: Icon(icon ?? Icons.circle, size: 16),
+        icon: Icon(
+          icon ?? Icons.circle,
+          size: 16,
+        ),
         label: Text(
           text,
           textAlign: TextAlign.center,
-          style: const TextStyle(fontWeight: FontWeight.bold),
+          style: const TextStyle(
+            fontWeight: FontWeight.bold,
+          ),
         ),
         style: ElevatedButton.styleFrom(
           backgroundColor: color,
@@ -327,6 +365,8 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
+  // الشاشة الأولى: البرنامج
+
   Widget buildProgramScreen() {
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -340,7 +380,9 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 5),
               Text(
                 fileInfo,
-                style: const TextStyle(color: Colors.white54),
+                style: const TextStyle(
+                  color: Colors.white54,
+                ),
               ),
               const SizedBox(height: 12),
               actionButton(
@@ -351,6 +393,7 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
+
         panelBox(
           title: 'TOOLPATH DISPLAY',
           child: Container(
@@ -374,6 +417,7 @@ class _MainScreenState extends State<MainScreen> {
             ),
           ),
         ),
+
         panelBox(
           title: 'PROGRAM RUN',
           child: Column(
@@ -411,7 +455,9 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 8),
               const Text(
                 'السطر الحالي: --     التقدم: 0%',
-                style: TextStyle(color: Colors.white54),
+                style: TextStyle(
+                  color: Colors.white54,
+                ),
               ),
             ],
           ),
@@ -420,8 +466,9 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  // شاشة الحركة والإحداثيات المدمجة
-  Widget buildJogCoordinatesScreen() {
+  // الشاشة الثانية: الحركة والإحداثيات والسرعات
+
+  Widget buildJogSpeedScreen() {
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
@@ -459,7 +506,9 @@ class _MainScreenState extends State<MainScreen> {
                 ),
                 selected: selectedAxis == axis,
                 onSelected: (_) {
-                  setState(() => selectedAxis = axis);
+                  setState(() {
+                    selectedAxis = axis;
+                  });
                 },
               );
             }).toList(),
@@ -474,17 +523,22 @@ class _MainScreenState extends State<MainScreen> {
               labelText: 'مسافة الحركة',
               border: OutlineInputBorder(),
             ),
-            items: ['0.01', '0.1', '1.0', '10.0']
-                .map(
-                  (v) => DropdownMenuItem(
-                    value: v,
-                    child: Text('$v mm'),
-                  ),
-                )
-                .toList(),
+            items: [
+              '0.01',
+              '0.1',
+              '1.0',
+              '10.0',
+            ].map((v) {
+              return DropdownMenuItem(
+                value: v,
+                child: Text('$v mm'),
+              );
+            }).toList(),
             onChanged: (v) {
               if (v != null) {
-                setState(() => jogStep = v);
+                setState(() {
+                  jogStep = v;
+                });
               }
             },
           ),
@@ -524,15 +578,6 @@ class _MainScreenState extends State<MainScreen> {
                 () => unavailable('Home All'),
                 icon: Icons.home,
               ),
-              const SizedBox(height: 10),
-              const Text(
-                'أوامر الحركة لن تعمل قبل ربط برنامج Windows',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white54,
-                  fontSize: 12,
-                ),
-              ),
             ],
           ),
         ),
@@ -547,10 +592,175 @@ class _MainScreenState extends State<MainScreen> {
                 min: 1,
                 max: 100,
                 onChanged: (v) {
-                  setState(() => feed = v);
+                  setState(() {
+                    feed = v;
+                  });
                 },
               ),
               Text('${feed.toInt()}%'),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'SPINDLE',
+          child: Column(
+            children: [
+              Text(
+                'RPM: ${rpm.toInt()}',
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
+              ),
+              Slider(
+                value: rpm,
+                min: 0,
+                max: 10000,
+                onChanged: (v) {
+                  setState(() {
+                    rpm = v;
+                  });
+                },
+              ),
+              Row(
+                children: [
+                  Expanded(
+                    child: actionButton(
+                      'SPINDLE ON',
+                      () => unavailable('Spindle On'),
+                      color: const Color(0xFF167A42),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: actionButton(
+                      'SPINDLE OFF',
+                      () => unavailable('Spindle Off'),
+                      color: Colors.red.shade900,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'FEED RATE OVERRIDE',
+          child: Column(
+            children: [
+              Text(
+                '${feed.toInt()}%',
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
+              ),
+              Slider(
+                value: feed.clamp(10, 150),
+                min: 10,
+                max: 150,
+                onChanged: (v) {
+                  setState(() {
+                    feed = v;
+                  });
+                },
+              ),
+              const Text('Feed Override'),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'SPINDLE OVERRIDE',
+          child: Column(
+            children: [
+              Text(
+                '${spindleOverride.toInt()}%',
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
+              ),
+              Slider(
+                value: spindleOverride,
+                min: 50,
+                max: 150,
+                onChanged: (v) {
+                  setState(() {
+                    spindleOverride = v;
+                  });
+                },
+              ),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'COOLANT',
+          child: Row(
+            children: [
+              Expanded(
+                child: actionButton(
+                  'COOLANT ON',
+                  () => unavailable('Coolant On'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: actionButton(
+                  'COOLANT OFF',
+                  () => unavailable('Coolant Off'),
+                  color: Colors.red.shade900,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  // الشاشة الثالثة: الأوفست
+
+  Widget buildOffsetsScreen() {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        panelBox(
+          title: 'WORK OFFSET',
+          child: Column(
+            children: [
+              const Text('Coordinate System'),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<String>(
+                value: workCoordinate,
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                ),
+                items: [
+                  'G54',
+                  'G55',
+                  'G56',
+                  'G57',
+                  'G58',
+                  'G59',
+                ].map((v) {
+                  return DropdownMenuItem(
+                    value: v,
+                    child: Text(v),
+                  );
+                }).toList(),
+                onChanged: (v) {
+                  if (v != null) {
+                    setState(() {
+                      workCoordinate = v;
+                    });
+                    unavailable('تغيير نظام الإحداثيات');
+                  }
+                },
+              ),
             ],
           ),
         ),
@@ -594,40 +804,20 @@ class _MainScreenState extends State<MainScreen> {
         ),
 
         panelBox(
-          title: 'WORK OFFSET',
+          title: 'TOOL OFFSET',
           child: Column(
             children: [
-              const Text('Coordinate System'),
-              const SizedBox(height: 8),
-              DropdownButtonFormField<String>(
-                value: workCoordinate,
-                decoration: const InputDecoration(
-                  border: OutlineInputBorder(),
+              const Text(
+                'إعداد صفر الأداة',
+                style: TextStyle(
+                  color: Colors.white70,
                 ),
-                items: [
-                  'G54',
-                  'G55',
-                  'G56',
-                  'G57',
-                  'G58',
-                  'G59',
-                ].map((v) {
-                  return DropdownMenuItem(
-                    value: v,
-                    child: Text(v),
-                  );
-                }).toList(),
-                onChanged: (v) {
-                  if (v != null) {
-                    setState(() => workCoordinate = v);
-                    unavailable('تغيير نظام الإحداثيات');
-                  }
-                },
               ),
               const SizedBox(height: 12),
               actionButton(
                 'TOOL ZERO',
                 () => unavailable('Tool Zero'),
+                icon: Icons.build,
               ),
             ],
           ),
@@ -636,119 +826,7 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  Widget buildSpeedScreen() {
-    return ListView(
-      padding: const EdgeInsets.all(12),
-      children: [
-        panelBox(
-          title: 'SPINDLE',
-          child: Column(
-            children: [
-              Text(
-                'RPM: ${rpm.toInt()}',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
-              ),
-              Slider(
-                value: rpm,
-                min: 0,
-                max: 10000,
-                onChanged: (v) => setState(() => rpm = v),
-              ),
-              Row(
-                children: [
-                  Expanded(
-                    child: actionButton(
-                      'SPINDLE ON',
-                      () => unavailable('Spindle On'),
-                      color: const Color(0xFF167A42),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: actionButton(
-                      'SPINDLE OFF',
-                      () => unavailable('Spindle Off'),
-                      color: Colors.red.shade900,
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-
-        panelBox(
-          title: 'FEED RATE OVERRIDE',
-          child: Column(
-            children: [
-              Text(
-                '${feed.toInt()}%',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
-              ),
-              Slider(
-                value: feed.clamp(10, 150),
-                min: 10,
-                max: 150,
-                onChanged: (v) => setState(() => feed = v),
-              ),
-              const Text('Feed Override'),
-            ],
-          ),
-        ),
-
-        panelBox(
-          title: 'SPINDLE OVERRIDE',
-          child: Column(
-            children: [
-              Text(
-                '${spindleOverride.toInt()}%',
-                style: const TextStyle(
-                  fontSize: 24,
-                  color: green,
-                ),
-              ),
-              Slider(
-                value: spindleOverride,
-                min: 50,
-                max: 150,
-                onChanged: (v) {
-                  setState(() => spindleOverride = v);
-                },
-              ),
-            ],
-          ),
-        ),
-
-        panelBox(
-          title: 'COOLANT',
-          child: Row(
-            children: [
-              Expanded(
-                child: actionButton(
-                  'COOLANT ON',
-                  () => unavailable('Coolant On'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: actionButton(
-                  'COOLANT OFF',
-                  () => unavailable('Coolant Off'),
-                  color: Colors.red.shade900,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
+  // الشاشة الرابعة: الملفات
 
   Widget buildFilesScreen() {
     return ListView(
@@ -769,7 +847,9 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 5),
               Text(
                 fileInfo,
-                style: const TextStyle(color: Colors.white54),
+                style: const TextStyle(
+                  color: Colors.white54,
+                ),
               ),
               const SizedBox(height: 15),
               actionButton(
@@ -801,7 +881,9 @@ class _MainScreenState extends State<MainScreen> {
               child: Text(
                 'سيظهر محتوى G-code بعد تجهيز قارئ الملفات',
                 textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white54),
+                style: TextStyle(
+                  color: Colors.white54,
+                ),
               ),
             ),
           ),
@@ -809,6 +891,8 @@ class _MainScreenState extends State<MainScreen> {
       ],
     );
   }
+
+  // الشاشة الخامسة: الاتصال
 
   Widget buildConnectionScreen() {
     return ListView(
@@ -874,7 +958,11 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 10),
               actionButton(
                 'فصل الاتصال',
-                () => setState(() => connected = false),
+                () {
+                  setState(() {
+                    connected = false;
+                  });
+                },
                 color: Colors.red.shade900,
                 icon: Icons.wifi_off,
               ),
@@ -891,7 +979,9 @@ class _MainScreenState extends State<MainScreen> {
               SizedBox(height: 8),
               Text('Network: Wi-Fi Local Network'),
               SizedBox(height: 8),
-              Text('Protocol: WebSocket - سيتم تفعيله لاحقاً'),
+              Text(
+                'Protocol: WebSocket - سيتم تفعيله لاحقاً',
+              ),
             ],
           ),
         ),
@@ -899,28 +989,22 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
+  // تحديد الشاشة الحالية
+
   Widget currentPage() {
     switch (page) {
       case 0:
         return buildProgramScreen();
       case 1:
-        return buildJogCoordinatesScreen();
+        return buildJogSpeedScreen();
       case 2:
-        return buildSpeedScreen();
+        return buildOffsetsScreen();
       case 3:
         return buildFilesScreen();
       default:
         return buildConnectionScreen();
     }
   }
-
-  final List<String> pageTitles = [
-    'PROGRAM RUN',
-    'JOG / COORDINATES',
-    'SPINDLE / FEED',
-    'FILES',
-    'CONNECTION',
-  ];
 
   @override
   Widget build(BuildContext context) {
@@ -939,15 +1023,22 @@ class _MainScreenState extends State<MainScreen> {
             margin: const EdgeInsets.symmetric(vertical: 7),
             child: ElevatedButton.icon(
               onPressed: emergencyStop,
-              icon: const Icon(Icons.warning, size: 17),
+              icon: const Icon(
+                Icons.warning,
+                size: 17,
+              ),
               label: const Text(
                 'E-STOP',
-                style: TextStyle(fontWeight: FontWeight.bold),
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                ),
               ),
               style: ElevatedButton.styleFrom(
                 backgroundColor: red,
                 foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                ),
               ),
             ),
           ),
@@ -958,16 +1049,21 @@ class _MainScreenState extends State<MainScreen> {
         ],
       ),
 
-      body: SafeArea(child: currentPage()),
+      body: SafeArea(
+        child: currentPage(),
+      ),
 
       bottomNavigationBar: NavigationBar(
         selectedIndex: page,
         onDestinationSelected: (index) {
-          setState(() => page = index);
+          setState(() {
+            page = index;
+          });
         },
         backgroundColor: const Color(0xFF202832),
         indicatorColor: green.withOpacity(0.18),
-        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+        labelBehavior:
+            NavigationDestinationLabelBehavior.alwaysShow,
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.play_circle_outline),
@@ -975,11 +1071,11 @@ class _MainScreenState extends State<MainScreen> {
           ),
           NavigationDestination(
             icon: Icon(Icons.gamepad),
-            label: 'الحركة',
+            label: 'الحركة والسرعات',
           ),
           NavigationDestination(
-            icon: Icon(Icons.speed),
-            label: 'السرعات',
+            icon: Icon(Icons.tune),
+            label: 'الأوفست',
           ),
           NavigationDestination(
             icon: Icon(Icons.folder),
@@ -994,6 +1090,8 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 }
+
+// رسم تجريبي لمسار الأداة
 
 class ToolpathPainter extends CustomPainter {
   const ToolpathPainter();
@@ -1026,15 +1124,31 @@ class ToolpathPainter extends CustomPainter {
       ..style = PaintingStyle.stroke;
 
     final path = Path()
-      ..moveTo(size.width * 0.2, size.height * 0.3)
-      ..lineTo(size.width * 0.8, size.height * 0.3)
-      ..lineTo(size.width * 0.8, size.height * 0.7)
-      ..lineTo(size.width * 0.2, size.height * 0.7)
+      ..moveTo(
+        size.width * 0.2,
+        size.height * 0.3,
+      )
+      ..lineTo(
+        size.width * 0.8,
+        size.height * 0.3,
+      )
+      ..lineTo(
+        size.width * 0.8,
+        size.height * 0.7,
+      )
+      ..lineTo(
+        size.width * 0.2,
+        size.height * 0.7,
+      )
       ..close();
 
     canvas.drawPath(path, pathPaint);
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(
+    covariant CustomPainter oldDelegate,
+  ) {
+    return false;
+  }
 }
