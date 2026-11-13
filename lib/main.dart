@@ -61,7 +61,10 @@ class _MainScreenState extends State<MainScreen> {
   double y = 0;
   double z = 0;
 
-  double feed = 100;
+  // متغيرات السرعات المستقلة
+  double jogSpeed = 50;
+  double feedOverride = 100;
+
   double rpm = 0;
   double spindleOverride = 100;
 
@@ -588,16 +591,16 @@ class _MainScreenState extends State<MainScreen> {
             children: [
               const Text('سرعة الحركة'),
               Slider(
-                value: feed.clamp(1, 100),
+                value: jogSpeed.clamp(1, 100).toDouble(),
                 min: 1,
                 max: 100,
                 onChanged: (v) {
                   setState(() {
-                    feed = v;
+                    jogSpeed = v;
                   });
                 },
               ),
-              Text('${feed.toInt()}%'),
+              Text('${jogSpeed.toInt()}%'),
             ],
           ),
         ),
@@ -651,19 +654,19 @@ class _MainScreenState extends State<MainScreen> {
           child: Column(
             children: [
               Text(
-                '${feed.toInt()}%',
+                '${feedOverride.toInt()}%',
                 style: const TextStyle(
                   fontSize: 24,
                   color: green,
                 ),
               ),
               Slider(
-                value: feed.clamp(10, 150),
+                value: feedOverride.clamp(10, 150).toDouble(),
                 min: 10,
                 max: 150,
                 onChanged: (v) {
                   setState(() {
-                    feed = v;
+                    feedOverride = v;
                   });
                 },
               ),
