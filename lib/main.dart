@@ -49,10 +49,10 @@ class _MainScreenState extends State<MainScreen> {
   String port = '8765';
 
   bool connected = false;
-  bool machineRunning = false;
 
   String selectedAxis = 'X';
   String jogStep = '1.0';
+  String workCoordinate = 'G54';
 
   String fileName = 'لم يتم اختيار ملف';
   String fileInfo = '';
@@ -156,9 +156,11 @@ class _MainScreenState extends State<MainScreen> {
               }
 
               await saveSettings(newIp, newPort);
+
               if (dialogContext.mounted) {
                 Navigator.pop(dialogContext);
               }
+
               notify('تم حفظ الإعدادات');
             },
             child: const Text('حفظ'),
@@ -185,7 +187,8 @@ class _MainScreenState extends State<MainScreen> {
 
       setState(() {
         fileName = selected.name;
-        fileInfo = 'الحجم: ${(selected.size / 1024).toStringAsFixed(1)} KB';
+        fileInfo =
+            'الحجم: ${(selected.size / 1024).toStringAsFixed(1)} KB';
       });
 
       notify('تم اختيار الملف. إرساله للكمبيوتر سيتم تفعيله لاحقاً');
@@ -288,7 +291,10 @@ class _MainScreenState extends State<MainScreen> {
     return Expanded(
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 3),
-        padding: const EdgeInsets.symmetric(vertical: 13, horizontal: 3),
+        padding: const EdgeInsets.symmetric(
+          vertical: 13,
+          horizontal: 3,
+        ),
         decoration: BoxDecoration(
           color: const Color(0xFF11161C),
           borderRadius: BorderRadius.circular(9),
@@ -359,7 +365,10 @@ class _MainScreenState extends State<MainScreen> {
               child: Center(
                 child: Text(
                   'معاينة تجريبية - ليست مسار الملف',
-                  style: TextStyle(color: Colors.white54, fontSize: 11),
+                  style: TextStyle(
+                    color: Colors.white54,
+                    fontSize: 11,
+                  ),
                 ),
               ),
             ),
@@ -411,10 +420,33 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  Widget buildJogScreen() {
+  // شاشة الحركة والإحداثيات المدمجة
+  Widget buildJogCoordinatesScreen() {
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
+        panelBox(
+          title: 'MACHINE COORDINATES',
+          child: Row(
+            children: [
+              valueBox('X', x),
+              valueBox('Y', y),
+              valueBox('Z', z),
+            ],
+          ),
+        ),
+
+        panelBox(
+          title: 'WORK COORDINATES',
+          child: Row(
+            children: [
+              valueBox('X', 0),
+              valueBox('Y', 0),
+              valueBox('Z', 0),
+            ],
+          ),
+        ),
+
         panelBox(
           title: 'SELECT AXIS',
           child: Row(
@@ -433,6 +465,7 @@ class _MainScreenState extends State<MainScreen> {
             }).toList(),
           ),
         ),
+
         panelBox(
           title: 'JOG STEP',
           child: DropdownButtonFormField<String>(
@@ -450,10 +483,13 @@ class _MainScreenState extends State<MainScreen> {
                 )
                 .toList(),
             onChanged: (v) {
-              if (v != null) setState(() => jogStep = v);
+              if (v != null) {
+                setState(() => jogStep = v);
+              }
             },
           ),
         ),
+
         panelBox(
           title: 'JOG CONTROL',
           child: Column(
@@ -488,57 +524,37 @@ class _MainScreenState extends State<MainScreen> {
                 () => unavailable('Home All'),
                 icon: Icons.home,
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
               const Text(
                 'أوامر الحركة لن تعمل قبل ربط برنامج Windows',
-                style: TextStyle(color: Colors.white54, fontSize: 12),
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 12,
+                ),
               ),
             ],
           ),
         ),
+
         panelBox(
           title: 'JOG SPEED',
           child: Column(
             children: [
               const Text('سرعة الحركة'),
               Slider(
-                value: feed,
+                value: feed.clamp(1, 100),
                 min: 1,
                 max: 100,
-                onChanged: (v) => setState(() => feed = v),
+                onChanged: (v) {
+                  setState(() => feed = v);
+                },
               ),
               Text('${feed.toInt()}%'),
             ],
           ),
         ),
-      ],
-    );
-  }
 
-  Widget buildCoordinatesScreen() {
-    return ListView(
-      padding: const EdgeInsets.all(12),
-      children: [
-        panelBox(
-          title: 'MACHINE COORDINATES',
-          child: Row(
-            children: [
-              valueBox('X', x),
-              valueBox('Y', y),
-              valueBox('Z', z),
-            ],
-          ),
-        ),
-        panelBox(
-          title: 'WORK COORDINATES',
-          child: Row(
-            children: [
-              valueBox('X', 0),
-              valueBox('Y', 0),
-              valueBox('Z', 0),
-            ],
-          ),
-        ),
         panelBox(
           title: 'ZERO AXIS',
           child: Column(
@@ -576,22 +592,37 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
+
         panelBox(
           title: 'WORK OFFSET',
           child: Column(
             children: [
               const Text('Coordinate System'),
+              const SizedBox(height: 8),
               DropdownButtonFormField<String>(
-                value: 'G54',
-                items: ['G54', 'G55', 'G56', 'G57', 'G58', 'G59']
-                    .map(
-                      (v) => DropdownMenuItem(
-                        value: v,
-                        child: Text(v),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (_) => unavailable('تغيير نظام الإحداثيات'),
+                value: workCoordinate,
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                ),
+                items: [
+                  'G54',
+                  'G55',
+                  'G56',
+                  'G57',
+                  'G58',
+                  'G59',
+                ].map((v) {
+                  return DropdownMenuItem(
+                    value: v,
+                    child: Text(v),
+                  );
+                }).toList(),
+                onChanged: (v) {
+                  if (v != null) {
+                    setState(() => workCoordinate = v);
+                    unavailable('تغيير نظام الإحداثيات');
+                  }
+                },
               ),
               const SizedBox(height: 12),
               actionButton(
@@ -615,7 +646,10 @@ class _MainScreenState extends State<MainScreen> {
             children: [
               Text(
                 'RPM: ${rpm.toInt()}',
-                style: const TextStyle(fontSize: 24, color: green),
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
               ),
               Slider(
                 value: rpm,
@@ -645,16 +679,20 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
+
         panelBox(
           title: 'FEED RATE OVERRIDE',
           child: Column(
             children: [
               Text(
                 '${feed.toInt()}%',
-                style: const TextStyle(fontSize: 24, color: green),
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
               ),
               Slider(
-                value: feed,
+                value: feed.clamp(10, 150),
                 min: 10,
                 max: 150,
                 onChanged: (v) => setState(() => feed = v),
@@ -663,23 +701,30 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
+
         panelBox(
           title: 'SPINDLE OVERRIDE',
           child: Column(
             children: [
               Text(
                 '${spindleOverride.toInt()}%',
-                style: const TextStyle(fontSize: 24, color: green),
+                style: const TextStyle(
+                  fontSize: 24,
+                  color: green,
+                ),
               ),
               Slider(
                 value: spindleOverride,
                 min: 50,
                 max: 150,
-                onChanged: (v) => setState(() => spindleOverride = v),
+                onChanged: (v) {
+                  setState(() => spindleOverride = v);
+                },
               ),
             ],
           ),
         ),
+
         panelBox(
           title: 'COOLANT',
           child: Row(
@@ -747,6 +792,7 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
+
         panelBox(
           title: 'FILE CONTENT',
           child: const SizedBox(
@@ -777,14 +823,20 @@ class _MainScreenState extends State<MainScreen> {
               const SizedBox(height: 5),
               Text(
                 ip,
-                style: const TextStyle(color: green, fontSize: 19),
+                style: const TextStyle(
+                  color: green,
+                  fontSize: 19,
+                ),
               ),
               const SizedBox(height: 12),
               const Text('Port'),
               const SizedBox(height: 5),
               Text(
                 port,
-                style: const TextStyle(color: green, fontSize: 19),
+                style: const TextStyle(
+                  color: green,
+                  fontSize: 19,
+                ),
               ),
               const SizedBox(height: 15),
               actionButton(
@@ -795,6 +847,7 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
+
         panelBox(
           title: 'CONNECTION STATUS',
           child: Column(
@@ -828,6 +881,7 @@ class _MainScreenState extends State<MainScreen> {
             ],
           ),
         ),
+
         panelBox(
           title: 'SYSTEM',
           child: const Column(
@@ -850,12 +904,10 @@ class _MainScreenState extends State<MainScreen> {
       case 0:
         return buildProgramScreen();
       case 1:
-        return buildJogScreen();
+        return buildJogCoordinatesScreen();
       case 2:
-        return buildCoordinatesScreen();
-      case 3:
         return buildSpeedScreen();
-      case 4:
+      case 3:
         return buildFilesScreen();
       default:
         return buildConnectionScreen();
@@ -864,8 +916,7 @@ class _MainScreenState extends State<MainScreen> {
 
   final List<String> pageTitles = [
     'PROGRAM RUN',
-    'JOG CONTROL',
-    'COORDINATES',
+    'JOG / COORDINATES',
     'SPINDLE / FEED',
     'FILES',
     'CONNECTION',
@@ -906,17 +957,16 @@ class _MainScreenState extends State<MainScreen> {
           ),
         ],
       ),
+
       body: SafeArea(child: currentPage()),
+
       bottomNavigationBar: NavigationBar(
         selectedIndex: page,
         onDestinationSelected: (index) {
           setState(() => page = index);
         },
         backgroundColor: const Color(0xFF202832),
-
-        // تم إصلاح السطر التالي ليتوافق مع Flutter 3.24
         indicatorColor: green.withOpacity(0.18),
-
         labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
         destinations: const [
           NavigationDestination(
@@ -926,10 +976,6 @@ class _MainScreenState extends State<MainScreen> {
           NavigationDestination(
             icon: Icon(Icons.gamepad),
             label: 'الحركة',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.my_location),
-            label: 'الإحداثيات',
           ),
           NavigationDestination(
             icon: Icon(Icons.speed),
